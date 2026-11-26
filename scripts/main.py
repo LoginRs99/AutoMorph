@@ -12,6 +12,7 @@ import sys
 import apkpure_fetcher
 import logging
 import manager
+import github_release
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ def main(project_root: Path, conf: dict) -> None:
             
             manager.clean(max_original_packages, max_patched_packages, state_dir, original_dir, patched_dir, patched_json)
             manager.build_all_jsons(state_dir, patched_json, base_url)
+            github_release.main(patched, state_dir, patched_json, project_root, patch_failures=patch_failures)
 
             dispatcher.main(
                 patch_success,

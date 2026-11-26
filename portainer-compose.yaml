@@ -1,0 +1,32 @@
+services:
+  automorph:
+    # Replace 'loginrs99' with your GitHub username if using a different fork
+    image: ghcr.io/loginrs99/automorph:latest
+    container_name: automorph
+    restart: unless-stopped
+    ports:
+      # Restrict to your LAN or Tailscale IP if desired, e.g. "192.168.1.100:8080:8080"
+      - "8080:8080"
+    volumes:
+      - /opt/automorph/apps:/automorph/apps:rw
+      - /opt/automorph/tools/morphe-data:/automorph/tools/morphe-data:rw
+      - /opt/automorph/tools/automorph-data:/automorph/tools/automorph-data:rw
+    environment:
+      - TZ=${TZ:-Etc/UTC}
+      - BASE_URL=${BASE_URL:-}
+      - GITHUB_RELEASE_REPO=${GITHUB_RELEASE_REPO:-}
+      - GITHUB_RELEASE_TOKEN=${GITHUB_RELEASE_TOKEN:-}
+      - GITHUB_RELEASE_KEEP=${GITHUB_RELEASE_KEEP:-2}
+      - GITHUB_RELEASE_PUBLISH_CONFIG=${GITHUB_RELEASE_PUBLISH_CONFIG:-true}
+      - GITHUB_RELEASE_EXCLUDE=${GITHUB_RELEASE_EXCLUDE:-}
+      - GITHUB_RELEASE_SYNC_ALL=${GITHUB_RELEASE_SYNC_ALL:-false}
+      - FORCE_GITHUB_RELEASE=${FORCE_GITHUB_RELEASE:-false}
+      - GITHUB_RELEASE_UPDATE_README=${GITHUB_RELEASE_UPDATE_README:-true}
+      - ALLOW_CERT_CHANGE=${ALLOW_CERT_CHANGE:-false}
+      - APPRISE_URL=${APPRISE_URL:-}
+      - APPRISE_NOTIFY_ON_FAILURE=${APPRISE_NOTIFY_ON_FAILURE:-true}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GOOPDL_ACCOUNT_EMAIL=${GOOPDL_ACCOUNT_EMAIL:-}
+      - GOOPDL_AAS_TOKEN=${GOOPDL_AAS_TOKEN:-}
+      - SMTP_USERNAME=${SMTP_USERNAME:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}

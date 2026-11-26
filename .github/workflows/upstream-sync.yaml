@@ -1,0 +1,53 @@
+name: Sync Upstream AutoMorph
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git and fetch upstream
+        id: check
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/holjab/AutoMorph.git || git remote set-url upstream https://github.com/holjab/AutoMorph.git
+          git fetch upstream main
+          AHEAD=$(git rev-list --count HEAD..upstream/main)
+          echo "ahead=${AHEAD}" >> "$GITHUB_OUTPUT"
+          echo "Upstream commits ahead of HEAD: ${AHEAD}"
+
+      - name: Merge upstream into sync branch and open PR
+        if: steps.check.outputs.ahead != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git checkout -B sync/upstream-main
+          if ! git merge upstream/main --no-edit; then
+            echo "::error::Merge conflicts detected while merging upstream/main. Please resolve manually."
+            git merge --abort || true
+            exit 1
+          fi
+          git push --force-with-lease origin sync/upstream-main
+          if gh pr view sync/upstream-main >/dev/null 2>&1; then
+            echo "Pull Request for sync/upstream-main already open; branch updated."
+          else
+            gh pr create \
+              --base main \
+              --head sync/upstream-main \
+              --title "chore: sync upstream holjab/AutoMorph" \
+              --body "Automated weekly/manual sync with \`holjab/AutoMorph\` (\`main\`). Review changes and merge when CI passes."
+          fi
