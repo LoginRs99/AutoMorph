@@ -484,6 +484,15 @@ def _upsert_release_and_upload(
                 del_resp = requests.delete(del_url, headers=headers, timeout=REQUEST_TIMEOUT)
                 if del_resp.status_code not in (200, 204, 404):
                     del_resp.raise_for_status()
+        patch_url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/releases/{release_id}"
+        patch_payload = {
+            "name": title,
+            "body": body,
+            "draft": False,
+            "prerelease": False,
+        }
+        patch_resp = requests.patch(patch_url, headers=headers, json=patch_payload, timeout=REQUEST_TIMEOUT)
+        patch_resp.raise_for_status()
     elif resp.status_code == 404:
         create_url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/releases"
         payload = {
@@ -985,78 +994,89 @@ def publish_repo_readme(
 
     certs = {r["cert_sha256"] for r in records if r.get("cert_sha256")}
     if len(certs) == 1:
-        cert_summary = f"`{next(iter(certs))}`"
+        cert_val = next(iter(certs))
+        cert_badge_val = cert_val[:12]
     elif len(certs) > 1:
-        cert_summary = "Per-app (see details below)"
+        cert_badge_val = "Per-app"
     else:
-        cert_summary = "N/A"
+        cert_badge_val = "N/A"
 
-    latest_ts = max((r["updated_at"] for r in records if r.get("updated_at")), default="")
-    last_updated_display = latest_ts[:19].replace("T", " ") + " UTC" if latest_ts else "N/A"
+    arches = sorted({r["arch"] for r in records if r.get("arch")})
+    arch_badge_val = ", ".join(arches) if arches else "arm64-v8a"
+
+    apps_badge = f"https://img.shields.io/badge/Active_Apps-{len(records)}-20cfce?style=flat-square"
+    arch_badge = f"https://img.shields.io/badge/Arch-{quote(arch_badge_val, safe='')}-4A7FC8?style=flat-square"
+    cert_badge = f"https://img.shields.io/badge/Signing_Cert-{quote(cert_badge_val, safe='')}-10B981?style=flat-square"
+    obtainium_badge = "https://img.shields.io/badge/Obtainium-Ready-6366F1?style=flat-square"
 
     lines = [
         "# AutoMorph Patched Builds",
         "",
-        "Automated Android APK builds patched with AutoMorph & Morphe Desktop.",
+        f"![Active Apps]({apps_badge}) ![Architecture]({arch_badge}) ![Signing Cert]({cert_badge}) ![Obtainium Ready]({obtainium_badge})",
         "",
-        "## Obtainium 1-Click Import",
+        "Automated Android APK builds patched locally with **AutoMorph** & **Morphe Desktop** and distributed via GitHub Releases.",
         "",
-        f"Import URL: `{config_url}`",
-        "",
-        "> **Note:** `Verify Latest Tag` is pre-configured to `OFF` (`verifyLatestTag: false`) in this export so Obtainium tracks per-app `{slug}-v...` tags cleanly.",
-        "",
-        f"**Active Apps:** {len(records)} | **Last Updated:** {last_updated_display} | **Signing Certificate Fingerprint:** {cert_summary}",
+        "> [!TIP]",
+        "> **Quick-Install with Obtainium (1-Click Import)**",
+        "> 1. Copy or import the config URL: `" + config_url + "`",
+        "> 2. In Obtainium, open **Import/Export → Obtainium Import** (`Verify Latest Tag: OFF` is pre-configured for all apps).",
+        "> 3. *(Private repo only)* Add a read-only GitHub PAT under **Settings → Source-Specific → GitHub PAT**.",
+        ">",
+        "> Browse: [**CHANGELOG.md**](./CHANGELOG.md) · [**catalog.json**](./catalog.json)",
         "",
         "## Available Builds",
         "",
-        "| App | Package | Version | Size | Android SDK | Patches | Updated (UTC) | Download |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| App | Version | Size | Android SDK | Patches | Updated (UTC) | Download |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
 
     if records:
         for r in records:
+            app_cell = f"**{r['clean_name']}** (`{r['slug']}`)"
             ver_cell = f"`v{r['version_name']}`"
-            if r["version_code"] is not None:
-                ver_cell += f" (`{r['version_code']}`)"
             if r["min_sdk"] is not None and r["target_sdk"] is not None:
                 sdk_cell = f"API {r['min_sdk']}–{r['target_sdk']}"
             elif r["min_sdk"] is not None:
                 sdk_cell = f"API {r['min_sdk']}+"
             else:
                 sdk_cell = "-"
-            patches_cell = f"{len(r['applied_patches'])} patches"
-            upd_cell = r["updated_at"][:19].replace("T", " ") if r["updated_at"] else "-"
+            patches_cell = str(len(r["applied_patches"]))
+            upd_cell = r["updated_at"][:10] if r["updated_at"] else "-"
             lines.append(
-                f"| {r['clean_name']} | `{r['patched_package_name']}` | {ver_cell} | "
-                f"{r['file_size']} | {sdk_cell} | {patches_cell} | {upd_cell} | [APK]({r['apk_url']}) |"
+                f"| {app_cell} | {ver_cell} | {r['file_size']} | {sdk_cell} | "
+                f"{patches_cell} | {upd_cell} | **[⬇ Download APK]({r['apk_url']})** |"
             )
     else:
-        lines.append("| *No active published builds* | - | - | - | - | - | - | - |")
+        lines.append("| *No active published builds* | - | - | - | - | - | - |")
 
     if records:
-        lines.extend(["", "## Per-App Build & Patch Details", ""])
+        lines.extend(["", "## Expandable App Cards", ""])
         for r in records:
             esc_name = html.escape(r["clean_name"])
             esc_pkg = html.escape(r["patched_package_name"])
             esc_ver = html.escape(r["version_name"])
+            ver_code = str(r["version_code"]) if r["version_code"] is not None else "N/A"
+            repos_str = ", ".join(f"`{rp}`" for rp in r["repos"]) if r["repos"] else "N/A"
             lines.append(
                 f"<details><summary><strong>{esc_name}</strong> (<code>{esc_pkg}</code> — v{esc_ver})</summary>"
             )
             lines.append("")
-            lines.append(f"- **Source Package:** `{r['package_name']}`")
-            lines.append(f"- **Patched Package:** `{r['patched_package_name']}`")
-            lines.append(f"- **Architecture:** `{r['arch']}`")
-            lines.append(f"- **Morphe Desktop:** `{r['morphe_desktop_version']}`")
-            repos_str = ", ".join(f"`{rp}`" for rp in r["repos"]) if r["repos"] else "N/A"
-            lines.append(f"- **Patch Repositories:** {repos_str}")
-            lines.append(f"- **APK SHA-256:** `{r['sha256']}`")
-            lines.append(f"- **Signing Cert SHA-256:** `{r['cert_sha256'] or 'N/A'}`")
-            lines.append("- **Applied Patches:**")
+            lines.append("| Property | Value |")
+            lines.append("| --- | --- |")
+            lines.append(f"| **Source Package** | `{r['package_name']}` |")
+            lines.append(f"| **Patched Package** | `{r['patched_package_name']}` |")
+            lines.append(f"| **Version Code** | `{ver_code}` |")
+            lines.append(f"| **Morphe Engine** | `{r['morphe_desktop_version']}` |")
+            lines.append(f"| **APK SHA-256** | `{r['sha256']}` |")
+            lines.append(f"| **Signing Cert SHA-256** | `{r['cert_sha256'] or 'N/A'}` |")
+            lines.append(f"| **Patch Sources** | {repos_str} |")
+            lines.append("")
+            lines.append("**Applied Patches:**")
             if r["applied_patches"]:
                 for p in r["applied_patches"]:
-                    lines.append(f"  - {p}")
+                    lines.append(f"- {p}")
             else:
-                lines.append("  - None recorded")
+                lines.append("- None recorded")
             lines.append("")
             lines.append("</details>")
             lines.append("")

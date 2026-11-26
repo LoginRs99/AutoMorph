@@ -301,11 +301,14 @@ class TestGitHubRelease(unittest.TestCase):
             self.assertTrue(updated)
             put_json = mock_put.call_args.kwargs["json"]
             decoded = base64.b64decode(put_json["content"]).decode("utf-8")
-            self.assertIn("| App | Package | Version | Size | Android SDK | Patches | Updated (UTC) | Download |", decoded)
+            self.assertIn("| App | Version | Size | Android SDK | Patches | Updated (UTC) | Download |", decoded)
+            self.assertIn("img.shields.io/badge/Active_Apps-1", decoded)
+            self.assertIn("> [!TIP]", decoded)
             self.assertIn("API 26–35", decoded)
-            self.assertIn("2 patches", decoded)
+            self.assertIn("| **TikTok** (`tiktok`) | `v44.6.3` | 10.00 MB | API 26–35 | 2 | 2026-11-26 |", decoded)
             self.assertIn("<details><summary><strong>TikTok</strong>", decoded)
-            self.assertIn("  - Remove ads", decoded)
+            self.assertIn("| **Source Package** | `com.zhiliaoapp.musically` |", decoded)
+            self.assertIn("- Remove ads", decoded)
 
             updated_again = github_release.publish_repo_readme(
                 self.state_dir, self.patched_json, release_state, "user/builds", "tok", project_root=self.tmp
@@ -460,6 +463,44 @@ class TestGitHubRelease(unittest.TestCase):
         for yml_rel in ("portainer-compose.yaml", "default_compose.yaml", ".github/workflows/upstream-sync.yaml"):
             parsed = yaml.safe_load((REPO_ROOT / yml_rel).read_text(encoding="utf-8"))
             self.assertIsInstance(parsed, dict)
+
+    def test_9_same_version_rebuild_patches_release_body(self) -> None:
+        apk_path = self.tmp / "tiktok.apk"
+        apk_path.write_bytes(b"APKDATA")
+
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = {
+            "id": 777,
+            "html_url": "https://github.com/user/builds/releases/tag/tiktok-v44.6.3",
+            "assets": [{"id": 555, "name": "tiktok-44.6.3-arm64-v8a-morphe.apk"}],
+        }
+        del_resp = MagicMock(status_code=204)
+        patch_resp = MagicMock(status_code=200)
+        post_resp = MagicMock(status_code=201)
+
+        with patch("github_release.requests.get", return_value=get_resp), \
+             patch("github_release.requests.delete", return_value=del_resp) as mock_del, \
+             patch("github_release.requests.patch", return_value=patch_resp) as mock_patch, \
+             patch("github_release.requests.post", return_value=post_resp) as mock_post:
+            rel_id, rel_url = github_release._upsert_release_and_upload(
+                repo="user/builds",
+                token="tok",
+                tag="tiktok-v44.6.3",
+                title="TikTok v44.6.3 (arm64-v8a)",
+                body="#### What Changed\n- **Version:** Rebuild of v44.6.3\n  - `+ New patch`",
+                asset_path=apk_path,
+                asset_name="tiktok-44.6.3-arm64-v8a-morphe.apk",
+                content_type="application/vnd.android.package-archive",
+            )
+
+        self.assertEqual(rel_id, 777)
+        self.assertIn("tiktok-v44.6.3", rel_url)
+        mock_del.assert_called_once()
+        mock_patch.assert_called_once()
+        patch_json = mock_patch.call_args.kwargs["json"]
+        self.assertIn("Rebuild of v44.6.3", patch_json["body"])
+        self.assertIn("+ New patch", patch_json["body"])
+        mock_post.assert_called_once()
 
 
 if __name__ == "__main__":
