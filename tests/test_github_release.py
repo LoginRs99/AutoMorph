@@ -568,6 +568,69 @@ class TestGitHubRelease(unittest.TestCase):
                 312190100,
             )
 
+    def test_11_friendly_display_names_and_custom_labels(self) -> None:
+        dummy_apk = self.tmp / "dummy.apk"
+        patched = {
+            "com.zhiliaoapp.musically": {
+                "44.6.3": _make_patched_entry("com.zhiliaoapp.musically", "44.6.3", 440, dummy_apk, ["P1"], clean_name="com.zhiliaoapp.musically"),
+            },
+            "com.reddit.frontpage": {
+                "2026.40.0": _make_patched_entry("com.reddit.frontpage", "2026.40.0", 2026, dummy_apk, ["P1"], clean_name=""),
+            },
+            "com.google.android.youtube": {
+                "21.30.216": _make_patched_entry("com.google.android.youtube", "21.30.216", 2130, dummy_apk, ["P1"], clean_name="YouTube LG"),
+            },
+        }
+        slugs = github_release._resolve_app_slugs(patched)
+        self.assertEqual(slugs["com.zhiliaoapp.musically"], "tiktok")
+        self.assertEqual(slugs["com.reddit.frontpage"], "reddit")
+        self.assertEqual(slugs["com.google.android.youtube"], "youtube-lg")
+        self.assertEqual(github_release._resolve_display_name("com.zhiliaoapp.musically", "com.zhiliaoapp.musically"), "TikTok")
+        self.assertEqual(github_release._resolve_display_name("com.reddit.frontpage", ""), "Reddit")
+        self.assertEqual(github_release._resolve_display_name("com.google.android.youtube", "YouTube LG"), "YouTube LG")
+
+    def test_12_rollback_selects_on_disk_and_prunes_higher_release(self) -> None:
+        missing_apk = self.tmp / "apps" / "patched" / "com.twitter.android" / "12.38.1-prod.01" / "com.twitter.android_12.38.1-prod.01_patched.apk"
+        present_apk = self.tmp / "apps" / "patched" / "com.twitter.android" / "12.19.1-release.0" / "com.twitter.android_12.19.1-release.0_patched.apk"
+        present_apk.parent.mkdir(parents=True, exist_ok=True)
+        present_apk.write_bytes(b"APK")
+
+        versions = {
+            "12.38.1-prod.01": _make_patched_entry("com.twitter.android", "12.38.1-prod.01", 312380100, missing_apk, ["P1"], clean_name="X LG"),
+            "12.19.1-release.0": _make_patched_entry("com.twitter.android", "12.19.1-release.0", 312190100, present_apk, ["P1"], clean_name="X LG"),
+        }
+        selected = github_release._select_active_version_entry(versions, package_name="com.twitter.android", project_root=self.tmp)
+        self.assertEqual(selected, "12.19.1-release.0")
+
+        mock_releases = [
+            {"id": 10, "tag_name": "x-lg-v12.38.1-prod.01", "created_at": "2026-11-26T12:00:00Z"},
+            {"id": 11, "tag_name": "x-lg-v12.19.1-release.0", "created_at": "2026-11-25T12:00:00Z"},
+        ]
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = mock_releases
+        del_resp = MagicMock(status_code=204)
+
+        release_state = {
+            "com.twitter.android": {
+                "12.38.1-prod.01": {"tag": "x-lg-v12.38.1-prod.01"},
+                "12.19.1-release.0": {"tag": "x-lg-v12.19.1-release.0"},
+            }
+        }
+        with patch("github_release.requests.get", return_value=get_resp), \
+             patch("github_release.requests.delete", return_value=del_resp):
+            deleted = github_release.prune_old_releases(
+                "com.twitter.android",
+                "user/builds",
+                "tok",
+                keep=2,
+                release_state=release_state,
+                slug="x-lg",
+                active_version="12.19.1-release.0",
+            )
+        self.assertEqual(deleted, ["x-lg-v12.38.1-prod.01"])
+        self.assertNotIn("12.38.1-prod.01", release_state["com.twitter.android"])
+        self.assertIn("12.19.1-release.0", release_state["com.twitter.android"])
+
 
 if __name__ == "__main__":
     unittest.main()

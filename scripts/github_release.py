@@ -101,40 +101,120 @@ def _slugify_label(label: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", str(label).lower()).strip("-")
 
 
+KNOWN_APP_NAMES: dict[str, str] = {
+    "com.zhiliaoapp.musically": "TikTok",
+    "com.ss.android.ugc.trill": "TikTok",
+    "com.reddit.frontpage": "Reddit",
+    "com.google.android.youtube": "YouTube",
+    "com.google.android.apps.youtube.music": "YouTube Music",
+    "com.twitter.android": "X",
+    "com.instagram.android": "Instagram",
+    "com.spotify.music": "Spotify",
+    "com.discord": "Discord",
+    "tv.twitch.android.app": "Twitch",
+}
+
+
+def _resolve_display_name(package_name: str, raw_clean_name: Any) -> str:
+    """Returns a friendly display name, falling back to KNOWN_APP_NAMES when raw_clean_name is empty or equals package_name."""
+    raw = str(raw_clean_name or "").strip()
+    if not raw or raw.lower() == package_name.lower():
+        return KNOWN_APP_NAMES.get(package_name, package_name)
+    return raw
+
+
+def _parse_version_tuple(ver_str: str) -> tuple[int, ...]:
+    """Parses the numeric base version (before '-') into a comparable tuple."""
+    base = str(ver_str).lstrip("v").split("-", 1)[0]
+    nums = [int(p) for p in re.findall(r"\d+", base)]
+    return tuple(nums) if nums else (0,)
+
+
+def _version_has_apk_on_disk(
+    entry: Any,
+    package_name: str | None = None,
+    version_name: str | None = None,
+    project_root: Path | None = None,
+) -> bool:
+    """Returns True if the patched APK for this version entry exists on disk."""
+    if isinstance(entry, dict):
+        loc = entry.get("file", {}).get("location")
+        if loc and Path(loc).is_file():
+            return True
+    if project_root is not None and package_name and version_name:
+        candidate = (
+            project_root
+            / "apps"
+            / "patched"
+            / package_name
+            / version_name
+            / f"{package_name}_{version_name}_patched.apk"
+        )
+        if candidate.is_file():
+            return True
+    return False
+
+
 def _select_latest_version(versions: dict[str, Any]) -> str | None:
     """Selects the latest version key from a package's entries in patched.json."""
     if not versions:
         return None
 
-    def _version_sort_key(v: str) -> int:
+    def _version_sort_key(v: str) -> tuple[int, tuple[int, ...]]:
         entry = versions.get(v)
         pkg = entry.get("package", {}) if isinstance(entry, dict) else {}
         raw_vc = pkg.get("source_version_code")
         if raw_vc is None:
             raw_vc = pkg.get("patched_version_code")
         try:
-            return int(raw_vc) if raw_vc is not None else 0
+            vc_int = int(raw_vc) if raw_vc is not None else 0
         except (TypeError, ValueError):
-            return 0
+            vc_int = 0
+        return (vc_int, _parse_version_tuple(v))
 
     sorted_versions = sorted(versions.keys(), key=_version_sort_key, reverse=True)
     return sorted_versions[0]
 
 
-def _resolve_app_slugs(patched_results: dict[str, Any]) -> dict[str, str]:
+def _select_active_version_entry(
+    versions: dict[str, Any],
+    package_name: str | None = None,
+    project_root: Path | None = None,
+) -> str | None:
+    """
+    Selects the newest version key whose patched APK actually exists on disk,
+    falling back to `_select_latest_version(versions)` if none exist on disk.
+    """
+    if not isinstance(versions, dict) or not versions:
+        return None
+    on_disk = {
+        ver: entry
+        for ver, entry in versions.items()
+        if _version_has_apk_on_disk(entry, package_name=package_name, version_name=ver, project_root=project_root)
+    }
+    if on_disk:
+        return _select_latest_version(on_disk)
+    return _select_latest_version(versions)
+
+
+def _resolve_app_slugs(
+    patched_results: dict[str, Any],
+    project_root: Path | None = None,
+) -> dict[str, str]:
     """
     Maps each `package_name` in `patched_results` to a human-readable slug
-    derived from `package.clean_name`, falling back to `_slugify_label(package_name)`
+    derived from `_resolve_display_name(...)`, falling back to `_slugify_label(package_name)`
     if empty or if two packages collide on the same label slug.
     """
     raw_slugs: dict[str, str] = {}
     for package_name, versions in patched_results.items():
-        clean_name = ""
+        raw_clean = ""
         if isinstance(versions, dict) and versions:
-            latest_ver = _select_latest_version(versions)
+            latest_ver = _select_active_version_entry(versions, package_name=package_name, project_root=project_root)
             if latest_ver and isinstance(versions.get(latest_ver), dict):
-                clean_name = str(versions[latest_ver].get("package", {}).get("clean_name") or "").strip()
-        slug = _slugify_label(clean_name) if clean_name else ""
+                raw_clean = str(versions[latest_ver].get("package", {}).get("clean_name") or "").strip()
+        display_name = _resolve_display_name(package_name, raw_clean)
+        slug = _slugify_label(display_name)
         if not slug:
             slug = _slugify_label(package_name) or package_name.lower()
         raw_slugs[package_name] = slug
@@ -411,7 +491,7 @@ def _build_release_body(
     file_info = version_entry.get("file", {})
     meta_info = version_entry.get("metadata", {})
 
-    clean_name = pkg_info.get("clean_name", package_name)
+    clean_name = _resolve_display_name(package_name, pkg_info.get("clean_name"))
     patched_pkg = pkg_info.get("patched_package_name", package_name)
     arch = pkg_info.get("arch", "unknown")
     sha256 = file_info.get("sha256", "unknown")
@@ -608,7 +688,7 @@ def publish_package(
     pkg_info = version_entry.get("package", {})
     file_info = version_entry.get("file", {})
 
-    clean_name = pkg_info.get("clean_name", package_name)
+    clean_name = _resolve_display_name(package_name, pkg_info.get("clean_name"))
     arch = pkg_info.get("arch", "arm64-v8a")
     sha256 = file_info.get("sha256", "")
     apk_location = file_info.get("location")
@@ -721,10 +801,13 @@ def prune_old_releases(
     keep: int,
     release_state: dict[str, Any] | None = None,
     slug: str | None = None,
+    active_version: str | None = None,
 ) -> list[str]:
     """
     Deletes GitHub Releases (and their git tags) for `package_name` beyond
-    the newest `keep` releases, matching both `{slug}-v` and legacy `{package_name}-v`.
+    the newest `keep` releases, matching `{slug}-v`, `{package_name}-v`, and
+    `{_slugify_label(package_name)}-v`. When `active_version` is provided and
+    `keep >= 1`, also deletes any higher/superseded release (rollback cleanup).
     Returns a list of deleted tag names.
     """
     if keep <= 0:
@@ -736,9 +819,18 @@ def prune_old_releases(
     resp = requests.get(list_url, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
 
-    prefixes = [f"{package_name}-v"]
-    if slug and slug != package_name:
-        prefixes.insert(0, f"{slug}-v")
+    prefixes: list[str] = []
+    for candidate in (slug, package_name, _slugify_label(package_name)):
+        if candidate:
+            p = f"{candidate}-v"
+            if p not in prefixes:
+                prefixes.append(p)
+
+    def _extract_rel_version(tag_name: str) -> str:
+        for p in prefixes:
+            if tag_name.startswith(p):
+                return tag_name[len(p):]
+        return ""
 
     matching = [
         rel for rel in resp.json()
@@ -747,8 +839,22 @@ def prune_old_releases(
     ]
     matching.sort(key=lambda r: r.get("created_at", ""), reverse=True)
 
+    to_delete: list[dict[str, Any]] = []
+    kept_candidates: list[dict[str, Any]] = []
+    active_tuple = _parse_version_tuple(active_version) if active_version else None
+
+    for rel in matching:
+        rel_tag = str(rel.get("tag_name", ""))
+        rel_ver = _extract_rel_version(rel_tag)
+        if active_tuple is not None and rel_ver and _parse_version_tuple(rel_ver) > active_tuple:
+            to_delete.append(rel)
+        else:
+            kept_candidates.append(rel)
+
+    to_delete.extend(kept_candidates[keep:])
+
     deleted_tags: list[str] = []
-    for old_rel in matching[keep:]:
+    for old_rel in to_delete:
         old_id = old_rel.get("id")
         old_tag = str(old_rel.get("tag_name", ""))
         if old_id:
@@ -763,11 +869,9 @@ def prune_old_releases(
                 del_tag_resp.raise_for_status()
             deleted_tags.append(old_tag)
             if isinstance(release_state, dict) and package_name in release_state:
-                for p in prefixes:
-                    if old_tag.startswith(p):
-                        version_key = old_tag[len(p):]
-                        release_state[package_name].pop(version_key, None)
-                        break
+                version_key = _extract_rel_version(old_tag)
+                if version_key:
+                    release_state[package_name].pop(version_key, None)
             logger.info(f" └── [!] Pruned old GitHub Release: {old_tag}")
 
     return deleted_tags
@@ -844,7 +948,7 @@ def build_obtainium_github_export(
 
     active_packages = _get_active_packages(project_root) if project_root is not None else None
     excluded_packages = _get_excluded_packages()
-    slugs = _resolve_app_slugs(patched_results)
+    slugs = _resolve_app_slugs(patched_results, project_root=project_root)
 
     ob_export: dict[str, Any] = {"schemaVersion": 2, "apps": []}
 
@@ -856,14 +960,14 @@ def build_obtainium_github_export(
         if package_name in excluded_packages:
             continue
 
-        latest_version = _select_latest_version(versions)
+        latest_version = _select_active_version_entry(versions, package_name=package_name, project_root=project_root)
         if not latest_version:
             continue
 
         latest_details = versions[latest_version]
         pkg_info = latest_details.get("package", {})
         patched_package_name = pkg_info.get("patched_package_name") or package_name
-        clean_name = pkg_info.get("clean_name") or package_name
+        clean_name = _resolve_display_name(package_name, pkg_info.get("clean_name"))
         slug = slugs.get(package_name, _slugify_label(package_name))
 
         app_entry = _build_obtainium_app_entry(
@@ -947,7 +1051,7 @@ def _collect_active_published_records(
     patched_results = _read_json(patched_json)
     active_packages = _get_active_packages(project_root) if project_root is not None else None
     excluded_packages = _get_excluded_packages()
-    slugs = _resolve_app_slugs(patched_results)
+    slugs = _resolve_app_slugs(patched_results, project_root=project_root)
 
     records: list[dict[str, Any]] = []
     for package_name, versions in patched_results.items():
@@ -958,7 +1062,12 @@ def _collect_active_published_records(
         if package_name in excluded_packages:
             continue
 
-        latest_pub = _get_latest_published_entry(release_state, package_name)
+        active_ver = _select_active_version_entry(versions, package_name=package_name, project_root=project_root)
+        pkg_rel_state = release_state.get(package_name) if isinstance(release_state.get(package_name), dict) else {}
+        if active_ver and isinstance(pkg_rel_state.get(active_ver), dict):
+            latest_pub = {**pkg_rel_state[active_ver], "version_name": pkg_rel_state[active_ver].get("version_name") or active_ver}
+        else:
+            latest_pub = _get_latest_published_entry(release_state, package_name)
         if not latest_pub:
             continue
 
@@ -971,7 +1080,7 @@ def _collect_active_published_records(
         file_info = ver_details.get("file", {})
         patch_info = ver_details.get("patch", {})
 
-        clean_name = str(pkg_info.get("clean_name") or package_name)
+        clean_name = _resolve_display_name(package_name, pkg_info.get("clean_name"))
         patched_pkg = str(pkg_info.get("patched_package_name") or package_name)
         version_code = pkg_info.get("patched_version_code") or pkg_info.get("source_version_code")
         arch = str(pkg_info.get("arch") or "arm64-v8a")
@@ -1461,17 +1570,19 @@ def main(
             send_apprise_failure_notification(patch_failures, cert_mismatches, repo)
             return {}
 
-        slugs = _resolve_app_slugs(patched_results)
+        slugs = _resolve_app_slugs(patched_results, project_root=project_root)
         targets: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
+        active_versions: dict[str, str] = {}
 
         for package_name, details in (patched or {}).items():
             ver = details.get("version_name") if isinstance(details, dict) else None
             if not ver and package_name in patched_results:
-                ver = _select_latest_version(patched_results[package_name])
+                ver = _select_active_version_entry(patched_results[package_name], package_name=package_name, project_root=project_root)
             if ver and (package_name, ver) not in seen:
                 targets.append((package_name, ver))
                 seen.add((package_name, ver))
+                active_versions[package_name] = ver
 
         checked_count = 0
         skipped_count = 0
@@ -1485,12 +1596,13 @@ def main(
                 skipped_count += 1
                 logger.warning(f"[!] Skipping {package_name}: no version entries in patched.json")
                 continue
-            latest_ver = _select_latest_version(versions)
+            latest_ver = _select_active_version_entry(versions, package_name=package_name, project_root=project_root)
             if not latest_ver:
                 checked_count += 1
                 skipped_count += 1
                 logger.warning(f"[!] Skipping {package_name}: missing version metadata in patched.json")
                 continue
+            active_versions.setdefault(package_name, latest_ver)
             if (package_name, latest_ver) not in seen:
                 targets.append((package_name, latest_ver))
                 seen.add((package_name, latest_ver))
@@ -1542,6 +1654,14 @@ def main(
                 logger.error(f"[✗] Failed to publish GitHub Release for {package_name} v{version_name}: {e}")
 
         if keep > 0:
+            # Also trigger rollback cleanup if release_state holds any version higher than active_version
+            for pkg_name, active_ver in active_versions.items():
+                pkg_rel = release_state.get(pkg_name)
+                if isinstance(pkg_rel, dict):
+                    active_tup = _parse_version_tuple(active_ver)
+                    if any(_parse_version_tuple(v) > active_tup for v in pkg_rel.keys()):
+                        touched_packages.add(pkg_name)
+
             for package_name in touched_packages:
                 try:
                     prune_old_releases(
@@ -1551,6 +1671,7 @@ def main(
                         keep,
                         release_state=release_state,
                         slug=slugs.get(package_name),
+                        active_version=active_versions.get(package_name),
                     )
                 except Exception as e:
                     logger.error(f"[✗] Failed to prune old GitHub Releases for {package_name}: {e}")
