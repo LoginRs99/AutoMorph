@@ -142,17 +142,22 @@ def _resolve_apk_path(
 ) -> Path | None:
     """
     Returns the on-disk patched APK path for a version entry, or None if missing.
-    Prioritizes `state_dir.parent / "apks"` (e.g. `tools/automorph-data/apks`)
-    before `apps/patched`, and rewrites stale `/apps/patched/` prefixes in
-    `file.location` when the APK exists under `apks/`.
+    Checks in priority order:
+      1. Exact `file.location` if it exists on disk.
+      2. Remapped `/automorph/apps/...` or `apps/...` suffix under `state_dir.parent`
+         (and `state_dir.parent / "apks"` for `/apps/patched/`).
+      3. `state_dir.parent / "patched" / <pkg> / <ver> / ...`
+      4. `state_dir.parent / "apks" / <pkg> / <ver> / ...`
+      5. `project_root / "tools" / "automorph-data" / "patched" / ...` and `"apks" / ...`
+      6. `project_root / "apps" / "patched" / <pkg> / <ver> / ...`
     """
-    apks_roots: list[Path] = []
+    data_roots: list[Path] = []
     if state_dir is not None:
-        apks_roots.append(state_dir.parent / "apks")
+        data_roots.append(state_dir.parent)
     if project_root is not None:
-        default_apks = project_root / "tools" / "automorph-data" / "apks"
-        if default_apks not in apks_roots:
-            apks_roots.append(default_apks)
+        default_data = project_root / "tools" / "automorph-data"
+        if default_data not in data_roots:
+            data_roots.append(default_data)
 
     if isinstance(entry, dict):
         loc = entry.get("file", {}).get("location")
@@ -161,17 +166,33 @@ def _resolve_apk_path(
             if loc_path.is_file():
                 return loc_path
             loc_posix = str(loc).replace("\\", "/")
-            if "/apps/patched/" in loc_posix:
-                rel_suffix = loc_posix.split("/apps/patched/", 1)[1].lstrip("/")
-                for apks_root in apks_roots:
-                    rewritten = apks_root / rel_suffix
-                    if rewritten.is_file():
-                        return rewritten
+            if loc_posix.startswith("/automorph/apps/"):
+                rel_from_apps = loc_posix[len("/automorph/apps/"):].lstrip("/")
+            elif loc_posix.startswith("apps/"):
+                rel_from_apps = loc_posix[len("apps/"):].lstrip("/")
+            elif "/apps/" in loc_posix:
+                rel_from_apps = loc_posix.split("/apps/", 1)[1].lstrip("/")
+            else:
+                rel_from_apps = ""
+
+            if rel_from_apps:
+                for data_root in data_roots:
+                    remapped = data_root / rel_from_apps
+                    if remapped.is_file():
+                        return remapped
+                    if rel_from_apps.startswith("patched/"):
+                        apks_remapped = data_root / "apks" / rel_from_apps[len("patched/"):]
+                        if apks_remapped.is_file():
+                            return apks_remapped
 
     if package_name and version_name:
-        candidate_dirs: list[Path] = [root / package_name / version_name for root in apks_roots]
+        candidate_dirs: list[Path] = []
+        for data_root in data_roots:
+            candidate_dirs.append(data_root / "patched" / package_name / version_name)
+            candidate_dirs.append(data_root / "apks" / package_name / version_name)
         if project_root is not None:
             candidate_dirs.append(project_root / "apps" / "patched" / package_name / version_name)
+
         for base_dir in candidate_dirs:
             if not base_dir.is_dir():
                 continue
