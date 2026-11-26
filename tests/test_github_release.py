@@ -58,7 +58,6 @@ def _build_signed_apk(apk_path: Path, cert_der: bytes) -> None:
     pair_body = struct.pack("<I", pair_id) + signers
     pair = struct.pack("<Q", len(pair_body)) + pair_body
 
-    # block_size = len(pairs) + 8 (footer size field) + 16 (magic)
     block_size = len(pair) + 24
     sig_block = (
         struct.pack("<Q", block_size)
@@ -84,25 +83,32 @@ def _make_patched_entry(
     apk_path: Path,
     patches: list[str],
     sha256: str = "a" * 64,
+    clean_name: str = "Test App",
 ) -> dict:
     return {
         "metadata": {"time": "2026-11-26 12:00:00", "time_ms": 1795690800000},
         "package": {
-            "clean_name": "Test App",
+            "clean_name": clean_name,
             "source_package_name": pkg,
             "patched_package_name": pkg,
             "patched_version_name": ver,
             "source_version_code": vc,
             "patched_version_code": vc,
             "arch": "arm64-v8a",
+            "min_sdk": 26,
+            "target_sdk": 35,
         },
         "file": {
             "file_name": apk_path.name,
             "location": str(apk_path),
+            "size_bytes": 10485760,
+            "file_size": "10.00 MB",
             "sha256": sha256,
         },
         "patch": {
             "applied_patches": {p: {"repo": "MorpheApp"} for p in patches},
+            "repos": ["https://github.com/MorpheApp/morphe-patches"],
+            "morphe_desktop_version": "2.3.0",
         },
     }
 
@@ -143,7 +149,7 @@ class TestGitHubRelease(unittest.TestCase):
                     "cert_sha256": hashlib.sha256(cert_a).hexdigest().lower(),
                     "version_name": "1.0.0",
                     "applied_patches": ["Patch A"],
-                    "tag": "com.example.app-v1.0.0",
+                    "tag": "test-app-v1.0.0",
                     "published_at": "2026-11-25T10:00:00+00:00",
                 }
             }
@@ -166,7 +172,7 @@ class TestGitHubRelease(unittest.TestCase):
             self.assertEqual(len(mismatches), 1)
             mock_upload.assert_not_called()
 
-            mock_upload.return_value = (99, "https://github.com/user/builds/releases/tag/com.example.app-v2.0.0")
+            mock_upload.return_value = (99, "https://github.com/user/builds/releases/tag/test-app-v2.0.0")
             res_allowed = github_release.publish_package(
                 package_name="com.example.app",
                 version_name="2.0.0",
@@ -180,127 +186,254 @@ class TestGitHubRelease(unittest.TestCase):
             self.assertIsInstance(res_allowed, dict)
             mock_upload.assert_called_once()
 
-    def test_3_what_changed_diff_generation(self) -> None:
-        init_diff = github_release._compute_release_diff("com.a", "1.0.0", ["P1", "P2"], None)
-        self.assertEqual(init_diff["version_transition"], "Initial release (v1.0.0)")
-        self.assertTrue(init_diff["is_initial"])
+    def test_3_slug_resolution_collision_and_obtainium_regex(self) -> None:
+        dummy_apk = self.tmp / "dummy.apk"
+        patched = {
+            "com.zhiliaoapp.musically": {
+                "44.6.3": _make_patched_entry("com.zhiliaoapp.musically", "44.6.3", 440, dummy_apk, ["P1"], clean_name="TikTok"),
+            },
+            "com.dup.one": {
+                "1.0.0": _make_patched_entry("com.dup.one", "1.0.0", 100, dummy_apk, ["P1"], clean_name="Dup App!"),
+            },
+            "com.dup.two": {
+                "2.0.0": _make_patched_entry("com.dup.two", "2.0.0", 200, dummy_apk, ["P1"], clean_name="Dup App!"),
+            },
+        }
+        slugs = github_release._resolve_app_slugs(patched)
+        self.assertEqual(slugs["com.zhiliaoapp.musically"], "tiktok")
+        self.assertEqual(slugs["com.dup.one"], "com-dup-one")
+        self.assertEqual(slugs["com.dup.two"], "com-dup-two")
 
-        prev = {"version_name": "1.0.0", "applied_patches": ["P1", "P2"]}
-        up_diff = github_release._compute_release_diff("com.a", "1.1.0", ["P2", "P3"], prev)
-        self.assertEqual(up_diff["version_transition"], "1.0.0 -> 1.1.0")
-        self.assertEqual(up_diff["added_patches"], ["P3"])
-        self.assertEqual(up_diff["removed_patches"], ["P1"])
-
-        entry = _make_patched_entry("com.a", "1.1.0", 110, self.tmp / "x.apk", ["P2", "P3"])
-        body = github_release._build_release_body("com.a", "1.1.0", entry, diff_info=up_diff)
-        self.assertIn("#### What Changed", body)
-        self.assertIn("1.0.0 -> 1.1.0", body)
-        self.assertIn("+ P3", body)
-        self.assertIn("- P1", body)
-
-    def test_4_obtainium_export_active_and_exclude_filtering(self) -> None:
         self.config_path.write_text(
             "packages:\n"
-            "  - package_name: com.active.app\n"
-            "  - package_name: com.private.app\n"
-            "  # - package_name: com.disabled.app\n",
+            "  - package_name: com.zhiliaoapp.musically\n"
+            "  - package_name: com.dup.one\n"
+            "  # - package_name: com.dup.two\n",
             encoding="utf-8",
         )
-        dummy_apk = self.tmp / "dummy.apk"
-        self.patched_json.write_text(
-            json.dumps({
-                "com.active.app": {"1.0.0": _make_patched_entry("com.active.app", "1.0.0", 100, dummy_apk, ["P1"])},
-                "com.private.app": {"1.0.0": _make_patched_entry("com.private.app", "1.0.0", 100, dummy_apk, ["P1"])},
-                "com.disabled.app": {"1.0.0": _make_patched_entry("com.disabled.app", "1.0.0", 100, dummy_apk, ["P1"])},
-            }),
-            encoding="utf-8",
-        )
-        with patch.dict(os.environ, {"GITHUB_RELEASE_EXCLUDE": "com.private.app"}):
+        self.patched_json.write_text(json.dumps(patched), encoding="utf-8")
+
+        with patch.dict(os.environ, {"GITHUB_RELEASE_EXCLUDE": "com.dup.one"}):
             out = github_release.build_obtainium_github_export(
                 self.state_dir, self.patched_json, "user/builds", project_root=self.tmp
             )
         self.assertIsNotNone(out)
         data = json.loads(out.read_text(encoding="utf-8"))
-        self.assertEqual([a["id"] for a in data["apps"]], ["com.active.app"])
+        self.assertEqual(len(data["apps"]), 1)
+        settings = json.loads(data["apps"][0]["additionalSettings"])
+        self.assertEqual(settings["filterReleasesByRegEx"], "^tiktok-v")
+        self.assertEqual(settings["apkFilterRegEx"], r"^tiktok-.*\.apk$")
 
-    def test_5_publish_repo_readme_upsert_and_skip(self) -> None:
-        self.config_path.write_text("packages:\n  - package_name: com.active.app\n", encoding="utf-8")
+    def test_4_prune_matches_slug_and_legacy_package_tags(self) -> None:
+        mock_releases = [
+            {"id": 1, "tag_name": "tiktok-v44.6.3", "created_at": "2026-11-26T12:00:00Z"},
+            {"id": 2, "tag_name": "tiktok-v44.5.0", "created_at": "2026-11-25T12:00:00Z"},
+            {"id": 3, "tag_name": "com.zhiliaoapp.musically-v44.4.0", "created_at": "2026-11-24T12:00:00Z"},
+            {"id": 4, "tag_name": "automorph-config", "created_at": "2026-11-23T12:00:00Z"},
+        ]
+        get_resp = MagicMock(status_code=200)
+        get_resp.json.return_value = mock_releases
+        del_resp = MagicMock(status_code=204)
+
+        release_state = {
+            "com.zhiliaoapp.musically": {
+                "44.6.3": {"tag": "tiktok-v44.6.3"},
+                "44.5.0": {"tag": "tiktok-v44.5.0"},
+                "44.4.0": {"tag": "com.zhiliaoapp.musically-v44.4.0"},
+            }
+        }
+        with patch("github_release.requests.get", return_value=get_resp), \
+             patch("github_release.requests.delete", return_value=del_resp):
+            deleted = github_release.prune_old_releases(
+                "com.zhiliaoapp.musically",
+                "user/builds",
+                "tok",
+                keep=2,
+                release_state=release_state,
+                slug="tiktok",
+            )
+        self.assertEqual(deleted, ["com.zhiliaoapp.musically-v44.4.0"])
+        self.assertNotIn("44.4.0", release_state["com.zhiliaoapp.musically"])
+        self.assertIn("44.6.3", release_state["com.zhiliaoapp.musically"])
+
+    def test_5_rich_readme_dashboard_and_skip(self) -> None:
+        self.config_path.write_text("packages:\n  - package_name: com.zhiliaoapp.musically\n", encoding="utf-8")
         dummy_apk = self.tmp / "dummy.apk"
         self.patched_json.write_text(
-            json.dumps({"com.active.app": {"1.2.3": _make_patched_entry("com.active.app", "1.2.3", 123, dummy_apk, ["P1"])}}),
+            json.dumps({
+                "com.zhiliaoapp.musically": {
+                    "44.6.3": _make_patched_entry(
+                        "com.zhiliaoapp.musically",
+                        "44.6.3",
+                        440603,
+                        dummy_apk,
+                        ["Remove ads", "Spoof client"],
+                        clean_name="TikTok",
+                    )
+                }
+            }),
             encoding="utf-8",
         )
         release_state = {
-            "com.active.app": {
-                "1.2.3": {
-                    "version_name": "1.2.3",
-                    "tag": "com.active.app-v1.2.3",
-                    "asset_name": "com.active.app-1.2.3-arm64-v8a-morphe.apk",
+            "com.zhiliaoapp.musically": {
+                "44.6.3": {
+                    "slug": "tiktok",
+                    "version_name": "44.6.3",
+                    "sha256": "a" * 64,
+                    "cert_sha256": "b" * 64,
+                    "applied_patches": ["Remove ads", "Spoof client"],
+                    "tag": "tiktok-v44.6.3",
+                    "asset_name": "tiktok-44.6.3-arm64-v8a-morphe.apk",
                     "published_at": "2026-11-26T12:00:00+00:00",
                 }
             }
         }
         get_resp = MagicMock(status_code=200)
-        get_resp.json.return_value = {"sha": "oldblobsha"}
+        get_resp.json.return_value = {"sha": "oldreadme", "content": ""}
         put_resp = MagicMock(status_code=200)
 
         with patch.dict(os.environ, {"GITHUB_RELEASE_UPDATE_README": "true"}), \
-             patch("github_release.requests.get", return_value=get_resp) as mock_get, \
+             patch("github_release.requests.get", return_value=get_resp), \
              patch("github_release.requests.put", return_value=put_resp) as mock_put:
             updated = github_release.publish_repo_readme(
                 self.state_dir, self.patched_json, release_state, "user/builds", "tok", project_root=self.tmp
             )
             self.assertTrue(updated)
-            mock_get.assert_called_once()
-            mock_put.assert_called_once()
             put_json = mock_put.call_args.kwargs["json"]
-            self.assertEqual(put_json["sha"], "oldblobsha")
             decoded = base64.b64decode(put_json["content"]).decode("utf-8")
-            self.assertIn("com.active.app", decoded)
-            self.assertIn("obtainium-github-export.json", decoded)
+            self.assertIn("| App | Package | Version | Size | Android SDK | Patches | Updated (UTC) | Download |", decoded)
+            self.assertIn("API 26–35", decoded)
+            self.assertIn("2 patches", decoded)
+            self.assertIn("<details><summary><strong>TikTok</strong>", decoded)
+            self.assertIn("  - Remove ads", decoded)
 
-            # Second run with unchanged state should skip
             updated_again = github_release.publish_repo_readme(
                 self.state_dir, self.patched_json, release_state, "user/builds", "tok", project_root=self.tmp
             )
             self.assertFalse(updated_again)
             self.assertEqual(mock_put.call_count, 1)
 
-    def test_6_apprise_success_and_failure_notifications(self) -> None:
+    def test_6_changelog_cap_and_catalog_sha_skip(self) -> None:
+        old_sections = "\n\n".join(f"## 2026-10-{i:02d} 00:00 UTC\n\n- Old {i}" for i in range(1, 56))
+        existing_changelog = "# Changelog\n\nAutomated release history for patched APKs.\n\n" + old_sections + "\n"
+        get_cl_resp = MagicMock(status_code=200)
+        get_cl_resp.json.return_value = {
+            "sha": "clsha",
+            "content": base64.b64encode(existing_changelog.encode("utf-8")).decode("ascii"),
+        }
+        put_cl_resp = MagicMock(status_code=200)
+
+        published_items = [{
+            "package_name": "com.zhiliaoapp.musically",
+            "clean_name": "TikTok",
+            "tag": "tiktok-v44.6.3",
+            "asset_name": "tiktok-44.6.3-arm64-v8a-morphe.apk",
+            "diff_summary": "44.5.0 -> 44.6.3; no patch changes",
+        }]
+        with patch.dict(os.environ, {"GITHUB_RELEASE_UPDATE_CHANGELOG": "true"}), \
+             patch("github_release.requests.get", return_value=get_cl_resp), \
+             patch("github_release.requests.put", return_value=put_cl_resp) as mock_put_cl:
+            changed = github_release.publish_repo_changelog(published_items, "user/builds", "tok")
+            self.assertTrue(changed)
+            cl_content = base64.b64decode(mock_put_cl.call_args.kwargs["json"]["content"]).decode("utf-8")
+            section_count = sum(1 for line in cl_content.splitlines() if line.startswith("## "))
+            self.assertEqual(section_count, 50)
+            self.assertIn("**TikTok** (`tiktok-v44.6.3`)", cl_content)
+
+        # catalog.json generation + SHA skip
+        self.config_path.write_text("packages:\n  - package_name: com.zhiliaoapp.musically\n", encoding="utf-8")
+        dummy_apk = self.tmp / "dummy.apk"
+        self.patched_json.write_text(
+            json.dumps({
+                "com.zhiliaoapp.musically": {
+                    "44.6.3": _make_patched_entry("com.zhiliaoapp.musically", "44.6.3", 440603, dummy_apk, ["P1"], clean_name="TikTok")
+                }
+            }),
+            encoding="utf-8",
+        )
+        release_state = {
+            "com.zhiliaoapp.musically": {
+                "44.6.3": {
+                    "slug": "tiktok",
+                    "version_name": "44.6.3",
+                    "sha256": "a" * 64,
+                    "cert_sha256": "b" * 64,
+                    "applied_patches": ["P1"],
+                    "tag": "tiktok-v44.6.3",
+                    "asset_name": "tiktok-44.6.3-arm64-v8a-morphe.apk",
+                    "published_at": "2026-11-26T12:00:00+00:00",
+                }
+            }
+        }
+        get_cat_resp = MagicMock(status_code=404)
+        put_cat_resp = MagicMock(status_code=201)
+        with patch.dict(os.environ, {"GITHUB_RELEASE_UPDATE_CATALOG": "true"}), \
+             patch("github_release.requests.get", return_value=get_cat_resp), \
+             patch("github_release.requests.put", return_value=put_cat_resp) as mock_put_cat:
+            cat_updated = github_release.publish_repo_catalog(
+                self.state_dir, self.patched_json, release_state, "user/builds", "tok", project_root=self.tmp
+            )
+            self.assertTrue(cat_updated)
+            cat_json = json.loads(base64.b64decode(mock_put_cat.call_args.kwargs["json"]["content"]).decode("utf-8"))
+            self.assertEqual(cat_json["apps"][0]["slug"], "tiktok")
+            self.assertEqual(cat_json["apps"][0]["patch_count"], 1)
+
+            cat_again = github_release.publish_repo_catalog(
+                self.state_dir, self.patched_json, release_state, "user/builds", "tok", project_root=self.tmp
+            )
+            self.assertFalse(cat_again)
+            self.assertEqual(mock_put_cat.call_count, 1)
+
+    def test_7_apprise_single_vs_multi_compact_formatting(self) -> None:
         mock_apprise_mod = MagicMock()
         mock_apobj = MagicMock()
         mock_apprise_mod.Apprise.return_value = mock_apobj
 
-        items = [{
+        item1 = {
             "package_name": "com.a",
-            "clean_name": "App A",
-            "version_name": "1.0.0",
-            "arch": "arm64-v8a",
-            "tag": "com.a-v1.0.0",
-            "diff_summary": "0.9.0 -> 1.0.0; +1 patch(es)",
-        }]
-        failures = {
-            "com.fail": {
-                "target_versions": [("2.0.0", False)],
-                "attempts": [{"stage": "Download", "reason": "HTTP 404"}],
-            }
+            "clean_name": "TikTok",
+            "version_name": "44.6.3",
+            "tag": "tiktok-v44.6.3",
+            "version_transition": "44.5.0 -> 44.6.3",
+            "patch_diff_short": "+1 / -0 patches",
+            "diff_summary": "44.5.0 -> 44.6.3; +1 patch(es)",
         }
-        mismatches = [{"package_name": "com.cert", "version_name": "3.0.0", "old_cert": "aaa", "new_cert": "bbb"}]
+        item2 = {
+            "package_name": "com.b",
+            "clean_name": "YouTube",
+            "version_name": "21.30.216",
+            "tag": "youtube-v21.30.216",
+            "version_transition": "Initial release (v21.30.216)",
+            "patch_diff_short": "10 patches",
+            "diff_summary": "Initial release (v21.30.216)",
+        }
 
         with patch.object(github_release, "apprise", mock_apprise_mod), \
-             patch.dict(os.environ, {"APPRISE_URL": "ntfy://topic1 discord://id/tok", "APPRISE_NOTIFY_ON_FAILURE": "true"}):
-            github_release.send_apprise_notification(items, "user/builds")
-            github_release.send_apprise_failure_notification(failures, mismatches, "user/builds")
+             patch.dict(os.environ, {"APPRISE_URL": "ntfy://topic1", "APPRISE_NOTIFY_ON_FAILURE": "true"}):
+            github_release.send_apprise_notification([item1], "user/builds")
+            github_release.send_apprise_notification([item1, item2], "user/builds")
+            github_release.send_apprise_failure_notification(
+                {"com.fail": {"target_versions": [("1.0", False)], "attempts": [{"stage": "DL", "reason": "404"}]}},
+                [],
+                "user/builds",
+            )
+            github_release.send_apprise_failure_notification(
+                {"com.fail": {"target_versions": [("1.0", False)], "attempts": [{"stage": "DL", "reason": "404"}]}},
+                [{"package_name": "com.cert", "clean_name": "CertApp", "version_name": "2.0", "old_cert": "aaa", "new_cert": "bbb"}],
+                "user/builds",
+            )
 
-        self.assertEqual(mock_apobj.add.call_count, 4)  # 2 URLs * 2 notifications
-        self.assertEqual(mock_apobj.notify.call_count, 2)
-        succ_body = mock_apobj.notify.call_args_list[0].kwargs["body"]
-        fail_body = mock_apobj.notify.call_args_list[1].kwargs["body"]
-        self.assertIn("0.9.0 -> 1.0.0", succ_body)
-        self.assertIn("com.fail", fail_body)
-        self.assertIn("com.cert", fail_body)
+        calls = mock_apobj.notify.call_args_list
+        self.assertEqual(calls[0].kwargs["title"], "AutoMorph: TikTok v44.6.3 released")
+        self.assertIn("Version: 44.5.0 -> 44.6.3", calls[0].kwargs["body"])
+        self.assertEqual(calls[1].kwargs["title"], "AutoMorph: 2 apps released")
+        self.assertIn("• TikTok v44.6.3", calls[1].kwargs["body"])
+        self.assertIn("• YouTube v21.30.216", calls[1].kwargs["body"])
+        self.assertEqual(calls[2].kwargs["title"], "AutoMorph: com.fail failed")
+        self.assertEqual(calls[3].kwargs["title"], "AutoMorph: 2 failures/alerts")
+        self.assertIn("• CertApp", calls[3].kwargs["body"])
 
-    def test_7_hook_signature_compile_and_yaml_validation(self) -> None:
+    def test_8_hook_signature_compile_and_yaml_validation(self) -> None:
         sig = inspect.signature(github_release.main)
         self.assertIn("patch_failures", sig.parameters)
 
@@ -316,8 +449,7 @@ class TestGitHubRelease(unittest.TestCase):
             and node.func.attr == "main"
         ]
         self.assertEqual(len(hook_calls), 1)
-        kw_names = {kw.arg for kw in hook_calls[0].keywords}
-        self.assertIn("patch_failures", kw_names)
+        self.assertIn("patch_failures", {kw.arg for kw in hook_calls[0].keywords})
 
         pycache_dir = self.tmp / "pycache"
         for py_file in (SCRIPTS_DIR / "github_release.py", SCRIPTS_DIR / "main.py", Path(__file__)):

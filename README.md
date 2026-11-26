@@ -25,7 +25,7 @@ AutoMorph supports two distribution modes:
 
 1. **Fork Mode (Recommended — Local Web UI + GitHub Releases):**
    - Keep port `8080` bound to your LAN or Tailscale IP only—no public ingress or reverse-proxy tunnels required.
-   - After each build, `scripts/github_release.py` uploads patched APKs to your dedicated builds repository under `<package>-v<version>` tags, prunes older releases (`GITHUB_RELEASE_KEEP`), updates the builds repository's `README.md` dashboard, and publishes `obtainium-github-export.json` under the `automorph-config` release tag.
+   - After each build, `scripts/github_release.py` uploads patched APKs to your dedicated builds repository under human-readable `<slug>-v<version>` tags (e.g., `tiktok-v44.6.3`), prunes older releases (`GITHUB_RELEASE_KEEP`), updates the builds repository's `README.md` dashboard, rolling `CHANGELOG.md`, and `catalog.json`, and publishes `obtainium-github-export.json` under the `automorph-config` release tag.
 2. **Upstream Tunnel Mode (Still Supported):**
    - Expose the local portal and built-in F-Droid/Obtainium endpoints via Cloudflare Tunnel, Pangolin, or Tailscale Funnel using [`default_compose.yaml`](default_compose.yaml) and the [Remote Access & Tunnels Guide](docs/tunnels.md).
 
@@ -80,7 +80,7 @@ AutoMorph supports two distribution modes:
    ```text
    https://github.com/<owner>/<builds-repo>/releases/download/automorph-config/obtainium-github-export.json
    ```
-2. **Why `Verify Latest Tag` is `OFF`:** Because all apps share a single builds repository, each app entry in `obtainium-github-export.json` is pre-configured with `verifyLatestTag: false` and per-package regex filters (`^<package>-v` for tags and `^<package>-.*\.apk$` for assets) so apps never collide.
+2. **Why `Verify Latest Tag` is `OFF`:** Because all apps share a single builds repository, each app entry in `obtainium-github-export.json` is pre-configured with `verifyLatestTag: false` and per-app slug regex filters (`^<slug>-v` for tags, e.g., `^tiktok-v`, and `^<slug>-.*\.apk$` for assets, e.g., `^tiktok-.*\.apk$`) so apps never collide.
 3. *(Optional / Required if builds repo is Private)* Paste a read-only GitHub PAT under **Obtainium → Settings → GitHub Personal Access Token**.
 
 ---
@@ -106,6 +106,8 @@ AutoMorph supports two distribution modes:
 | `GITHUB_RELEASE_SYNC_ALL` | `false` | Catch up un-published latest versions in `patched.json` | `false` |
 | `FORCE_GITHUB_RELEASE` | `false` | Re-upload even if SHA-256 matches `github_releases.json` | `false` |
 | `GITHUB_RELEASE_UPDATE_README` | `true` | Auto-update `README.md` dashboard in builds repo | `true` |
+| `GITHUB_RELEASE_UPDATE_CHANGELOG` | `true` | Auto-update rolling `CHANGELOG.md` in builds repo | `true` |
+| `GITHUB_RELEASE_UPDATE_CATALOG` | `true` | Auto-update `catalog.json` in builds repo | `true` |
 | `ALLOW_CERT_CHANGE` | `false` | Allow upload if APK signing certificate SHA-256 changed | `false` |
 | `APPRISE_URL` | *(empty / disabled)* | Space/comma-separated Apprise notification URL(s) | `ntfy://topic discord://id/tok` |
 | `APPRISE_NOTIFY_ON_FAILURE` | `true` | Send Apprise alert on build failures or cert mismatches | `true` |

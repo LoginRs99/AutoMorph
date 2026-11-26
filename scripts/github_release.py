@@ -1,16 +1,18 @@
 """
 Isolated GitHub Releases publisher for AutoMorph.
-Uploads patched APKs to a GitHub repository, guards signing certificate
-fingerprints, computes release diffs, generates an Obtainium import
-configuration (`obtainium-github-export.json`), maintains a live builds
-`README.md` dashboard, and sends optional Apprise notifications.
+Uploads patched APKs to a GitHub repository using human-readable app slugs,
+guards signing certificate fingerprints, computes release diffs, generates
+`obtainium-github-export.json`, maintains a live `README.md` dashboard,
+rolling `CHANGELOG.md`, and `catalog.json`, and sends Apprise notifications.
 """
 
 from __future__ import annotations
 
 import base64
+from collections import Counter
 from datetime import datetime, timezone
 import hashlib
+import html
 import json
 import logging
 import os
@@ -36,6 +38,7 @@ GITHUB_UPLOADS_BASE = "https://uploads.github.com"
 REQUEST_TIMEOUT = 30
 UPLOAD_TIMEOUT = 300
 CONFIG_RELEASE_TAG = "automorph-config"
+MAX_CHANGELOG_SECTIONS = 50
 
 _APK_SIG_BLOCK_MAGIC = b"APK Sig Block 42"
 _APK_SIG_SCHEME_V2_ID = 0x7109871A
@@ -77,6 +80,68 @@ def _parse_keep_env(default: int = 2) -> int:
     except ValueError:
         logger.warning(f"[!] Invalid GITHUB_RELEASE_KEEP='{raw}', defaulting to {default}.")
         return default
+
+
+def _format_bytes(size_bytes: int | float | None) -> str:
+    if size_bytes is None:
+        return "-"
+    try:
+        val = float(size_bytes)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if val < 1024.0:
+            return f"{val:.2f} {unit}"
+        val /= 1024.0
+    return f"{val:.2f} PB"
+
+
+def _slugify_label(label: str) -> str:
+    """Normalizes a label into a lowercase hyphenated slug."""
+    return re.sub(r"[^a-z0-9]+", "-", str(label).lower()).strip("-")
+
+
+def _select_latest_version(versions: dict[str, Any]) -> str | None:
+    """Selects the latest version key from a package's entries in patched.json."""
+    if not versions:
+        return None
+    sorted_versions = sorted(
+        versions.keys(),
+        key=lambda v: versions[v].get("package", {}).get(
+            "source_version_code",
+            versions[v].get("package", {}).get("patched_version_code", 0),
+        ),
+        reverse=True,
+    )
+    return sorted_versions[0]
+
+
+def _resolve_app_slugs(patched_results: dict[str, Any]) -> dict[str, str]:
+    """
+    Maps each `package_name` in `patched_results` to a human-readable slug
+    derived from `package.clean_name`, falling back to `_slugify_label(package_name)`
+    if empty or if two packages collide on the same label slug.
+    """
+    raw_slugs: dict[str, str] = {}
+    for package_name, versions in patched_results.items():
+        clean_name = ""
+        if isinstance(versions, dict) and versions:
+            latest_ver = _select_latest_version(versions)
+            if latest_ver and isinstance(versions.get(latest_ver), dict):
+                clean_name = str(versions[latest_ver].get("package", {}).get("clean_name") or "").strip()
+        slug = _slugify_label(clean_name) if clean_name else ""
+        if not slug:
+            slug = _slugify_label(package_name) or package_name.lower()
+        raw_slugs[package_name] = slug
+
+    counts = Counter(raw_slugs.values())
+    resolved: dict[str, str] = {}
+    for package_name, slug in raw_slugs.items():
+        if counts[slug] > 1:
+            resolved[package_name] = _slugify_label(package_name) or package_name.lower()
+        else:
+            resolved[package_name] = slug
+    return resolved
 
 
 def _get_active_packages(project_root: Path) -> set[str] | None:
@@ -122,21 +187,6 @@ def _github_headers(token: str, content_type: str | None = None) -> dict[str, st
     if content_type:
         headers["Content-Type"] = content_type
     return headers
-
-
-def _select_latest_version(versions: dict[str, Any]) -> str | None:
-    """Selects the latest version key from a package's entries in patched.json."""
-    if not versions:
-        return None
-    sorted_versions = sorted(
-        versions.keys(),
-        key=lambda v: versions[v].get("package", {}).get(
-            "source_version_code",
-            versions[v].get("package", {}).get("patched_version_code", 0),
-        ),
-        reverse=True,
-    )
-    return sorted_versions[0]
 
 
 def _extract_apk_cert_sha256(apk_path: Path) -> str | None:
@@ -217,7 +267,6 @@ def _extract_apk_cert_sha256(apk_path: Path) -> str | None:
                 logger.debug(f"No v2/v3 signer block found in {apk_path.name}.")
                 return None
 
-            # signers -> first signer -> signed_data -> skip digests -> certificates -> first cert
             signers_len = struct.unpack_from("<I", scheme_data, 0)[0]
             if 4 + signers_len > len(scheme_data) or signers_len < 4:
                 return None
@@ -298,14 +347,20 @@ def _compute_release_diff(
             "added_patches": list(current_patches),
             "removed_patches": [],
             "is_initial": True,
+            "patch_diff_short": f"{len(current_patches)} patches",
             "summary": f"Initial release (v{version_name})",
         }
 
     prev_ver = str(prev_entry.get("version_name") or "").strip()
     if not prev_ver:
         prev_tag = str(prev_entry.get("tag") or "")
-        prefix = f"{package_name}-v"
-        prev_ver = prev_tag[len(prefix):] if prev_tag.startswith(prefix) else "unknown"
+        prev_slug = str(prev_entry.get("slug") or "").strip()
+        for prefix in ([f"{prev_slug}-v"] if prev_slug else []) + [f"{package_name}-v"]:
+            if prev_tag.startswith(prefix):
+                prev_ver = prev_tag[len(prefix):]
+                break
+        if not prev_ver:
+            prev_ver = "unknown"
 
     if prev_ver == version_name:
         version_transition = f"Rebuild of v{version_name}"
@@ -317,21 +372,25 @@ def _compute_release_diff(
     added = sorted(curr_patches - prev_patches)
     removed = sorted(prev_patches - curr_patches)
 
-    parts = [version_transition]
     if added or removed:
+        patch_diff_short = f"+{len(added)} / -{len(removed)} patches"
+        parts = [version_transition]
         if added:
-            parts.append(f"+{len(added)} patch(es)")
+            parts.append(f"+{len(added)}")
         if removed:
-            parts.append(f"-{len(removed)} patch(es)")
+            parts.append(f"-{len(removed)}")
+        summary = f"{version_transition}; {' / '.join(parts[1:])} patch(es)"
     else:
-        parts.append("no patch changes")
+        patch_diff_short = "No patch changes"
+        summary = f"{version_transition}; no patch changes"
 
     return {
         "version_transition": version_transition,
         "added_patches": added,
         "removed_patches": removed,
         "is_initial": False,
-        "summary": "; ".join(parts),
+        "patch_diff_short": patch_diff_short,
+        "summary": summary,
     }
 
 
@@ -460,6 +519,60 @@ def _upsert_release_and_upload(
     return release_id, release_url
 
 
+def _get_repo_file(
+    owner: str,
+    repo_name: str,
+    file_path: str,
+    token: str,
+) -> tuple[str | None, str | None]:
+    """Fetches `(sha, decoded_content)` from GitHub Contents API, or `(None, None)` on 404."""
+    headers = _github_headers(token)
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/contents/{quote(file_path, safe='/')}"
+    resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    if resp.status_code == 404:
+        return None, None
+    resp.raise_for_status()
+    data = resp.json()
+    sha = data.get("sha")
+    raw_b64 = data.get("content") or ""
+    decoded = ""
+    if raw_b64:
+        decoded = base64.b64decode(raw_b64.encode("ascii")).decode("utf-8", errors="replace")
+    return sha, decoded
+
+
+def _upsert_repo_file(
+    owner: str,
+    repo_name: str,
+    file_path: str,
+    content_str: str,
+    commit_message: str,
+    token: str,
+) -> bool:
+    """
+    Upserts a file in a GitHub repository via Contents API.
+    Skips the PUT if the existing remote content already matches `content_str`.
+    Returns True if a commit was made, False if skipped.
+    """
+    existing_sha, existing_content = _get_repo_file(owner, repo_name, file_path, token)
+    if existing_sha is not None and existing_content == content_str:
+        logger.debug(f"{file_path} unchanged on remote; skipping commit.")
+        return False
+
+    headers = _github_headers(token)
+    url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/contents/{quote(file_path, safe='/')}"
+    payload: dict[str, Any] = {
+        "message": commit_message,
+        "content": base64.b64encode(content_str.encode("utf-8")).decode("ascii"),
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    put_resp = requests.put(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+    put_resp.raise_for_status()
+    return True
+
+
 def publish_package(
     package_name: str,
     version_name: str,
@@ -470,6 +583,7 @@ def publish_package(
     force: bool = False,
     allow_cert_change: bool = False,
     cert_mismatches: list[dict[str, Any]] | None = None,
+    slug: str | None = None,
 ) -> dict[str, Any] | bool:
     """
     Upserts a GitHub Release for a single patched package version and streams
@@ -493,6 +607,8 @@ def publish_package(
     if not apk_path.is_file():
         logger.warning(f"[!] APK file not found on disk: {apk_path}. Skipping.")
         return False
+
+    resolved_slug = slug or _slugify_label(clean_name) or _slugify_label(package_name) or package_name.lower()
 
     existing_entry = release_state.get(package_name, {}).get(version_name)
     if (
@@ -533,8 +649,8 @@ def publish_package(
     applied_patches = _extract_applied_patches(version_entry)
     diff_info = _compute_release_diff(package_name, version_name, applied_patches, prev_entry)
 
-    tag = f"{package_name}-v{version_name}"
-    asset_name = f"{package_name}-{version_name}-{arch}-morphe.apk"
+    tag = f"{resolved_slug}-v{version_name}"
+    asset_name = f"{resolved_slug}-{version_name}-{arch}-morphe.apk"
     title = f"{clean_name} v{version_name} ({arch})"
     body = _build_release_body(
         package_name,
@@ -559,6 +675,7 @@ def publish_package(
     release_state.setdefault(package_name, {})[version_name] = {
         "sha256": sha256,
         "cert_sha256": new_cert_sha256,
+        "slug": resolved_slug,
         "version_name": version_name,
         "applied_patches": applied_patches,
         "tag": tag,
@@ -570,10 +687,14 @@ def publish_package(
     logger.info(f" └── [✓] Published GitHub Release {tag} ({asset_name})")
     return {
         "package_name": package_name,
+        "slug": resolved_slug,
         "clean_name": clean_name,
         "version_name": version_name,
         "arch": arch,
         "tag": tag,
+        "asset_name": asset_name,
+        "version_transition": diff_info["version_transition"],
+        "patch_diff_short": diff_info["patch_diff_short"],
         "diff_summary": diff_info["summary"],
     }
 
@@ -584,10 +705,12 @@ def prune_old_releases(
     token: str,
     keep: int,
     release_state: dict[str, Any] | None = None,
+    slug: str | None = None,
 ) -> list[str]:
     """
     Deletes GitHub Releases (and their git tags) for `package_name` beyond
-    the newest `keep` releases. Returns a list of deleted tag names.
+    the newest `keep` releases, matching both `{slug}-v` and legacy `{package_name}-v`.
+    Returns a list of deleted tag names.
     """
     if keep <= 0:
         return []
@@ -598,17 +721,21 @@ def prune_old_releases(
     resp = requests.get(list_url, headers=headers, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
 
-    prefix = f"{package_name}-v"
+    prefixes = [f"{package_name}-v"]
+    if slug and slug != package_name:
+        prefixes.insert(0, f"{slug}-v")
+
     matching = [
         rel for rel in resp.json()
-        if isinstance(rel, dict) and str(rel.get("tag_name", "")).startswith(prefix)
+        if isinstance(rel, dict)
+        and any(str(rel.get("tag_name", "")).startswith(p) for p in prefixes)
     ]
     matching.sort(key=lambda r: r.get("created_at", ""), reverse=True)
 
     deleted_tags: list[str] = []
     for old_rel in matching[keep:]:
         old_id = old_rel.get("id")
-        old_tag = old_rel.get("tag_name", "")
+        old_tag = str(old_rel.get("tag_name", ""))
         if old_id:
             del_rel_url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/releases/{old_id}"
             del_rel_resp = requests.delete(del_rel_url, headers=headers, timeout=REQUEST_TIMEOUT)
@@ -621,8 +748,11 @@ def prune_old_releases(
                 del_tag_resp.raise_for_status()
             deleted_tags.append(old_tag)
             if isinstance(release_state, dict) and package_name in release_state:
-                version_key = old_tag[len(prefix):]
-                release_state[package_name].pop(version_key, None)
+                for p in prefixes:
+                    if old_tag.startswith(p):
+                        version_key = old_tag[len(p):]
+                        release_state[package_name].pop(version_key, None)
+                        break
             logger.info(f" └── [!] Pruned old GitHub Release: {old_tag}")
 
     return deleted_tags
@@ -637,7 +767,7 @@ def build_obtainium_github_export(
     """
     Regenerates `state_dir / "obtainium-github-export.json"` (schemaVersion 2)
     pointing each active, non-excluded package in `patched.json` to
-    `https://github.com/{repo}` with per-package tag and APK regex filters.
+    `https://github.com/{repo}` with slug-based per-package tag and APK regex filters.
     """
     patched_results = _read_json(patched_json)
     if not patched_results:
@@ -645,6 +775,7 @@ def build_obtainium_github_export(
 
     active_packages = _get_active_packages(project_root) if project_root is not None else None
     excluded_packages = _get_excluded_packages()
+    slugs = _resolve_app_slugs(patched_results)
 
     ob_export: dict[str, Any] = {"schemaVersion": 2, "apps": []}
     repo_url = f"https://github.com/{repo}"
@@ -665,11 +796,12 @@ def build_obtainium_github_export(
         pkg_info = latest_details.get("package", {})
         patched_package_name = pkg_info.get("patched_package_name", package_name)
         clean_name = pkg_info.get("clean_name", package_name)
+        slug = slugs.get(package_name, _slugify_label(package_name))
 
         additional_settings = {
             "verifyLatestTag": False,
-            "filterReleasesByRegEx": f"^{re.escape(package_name)}-v",
-            "apkFilterRegEx": f"^{re.escape(package_name)}-.*\\.apk$",
+            "filterReleasesByRegEx": f"^{re.escape(slug)}-v",
+            "apkFilterRegEx": f"^{re.escape(slug)}-.*\\.apk$",
             "versionExtractionRegEx": r"\d+(\.\d+)+",
             "includePrereleases": False,
             "fallbackToOlderReleases": True,
@@ -721,7 +853,7 @@ def publish_obtainium_config_release(
         "### Setup Notes\n"
         "- Import `obtainium-github-export.json` in Obtainium (**Import/Export -> Obtainium Import**).\n"
         "- Each app has **Verify Latest Tag: OFF** (`verifyLatestTag: false`) so Obtainium resolves "
-        "per-package `{package_name}-v...` tags in a shared repository.\n"
+        "per-package `{slug}-v...` tags in a shared repository.\n"
         "- If this repository is **private**, configure a GitHub Personal Access Token (PAT) with "
         "`Contents: Read` permission in Obtainium (**Settings -> Source-Specific -> GitHub PAT**).\n"
     )
@@ -749,32 +881,20 @@ def publish_obtainium_config_release(
     logger.info(f" └── [✓] Published Obtainium config release: {CONFIG_RELEASE_TAG}")
 
 
-def publish_repo_readme(
-    state_dir: Path,
+def _collect_active_published_records(
     patched_json: Path,
     release_state: dict[str, Any],
     repo: str,
-    token: str,
     project_root: Path | None = None,
-    force: bool = False,
-) -> bool:
-    """
-    Generates and upserts `README.md` in the target builds repository with a
-    live table of active, published APKs and the Obtainium 1-click import URL.
-    Returns True if README.md was updated, False if skipped.
-    """
-    if not _parse_bool_env("GITHUB_RELEASE_UPDATE_README", default=True):
-        return False
-
+) -> list[dict[str, Any]]:
+    """Collects rich metadata records for all active, non-excluded published packages."""
     patched_results = _read_json(patched_json)
     active_packages = _get_active_packages(project_root) if project_root is not None else None
     excluded_packages = _get_excluded_packages()
+    slugs = _resolve_app_slugs(patched_results)
 
-    config_url = f"https://github.com/{repo}/releases/download/{CONFIG_RELEASE_TAG}/obtainium-github-export.json"
-    rows: list[str] = []
-
-    for package_name in sorted(patched_results.keys()):
-        versions = patched_results[package_name]
+    records: list[dict[str, Any]] = []
+    for package_name, versions in patched_results.items():
         if not isinstance(versions, dict) or not versions:
             continue
         if active_packages is not None and package_name not in active_packages:
@@ -788,22 +908,94 @@ def publish_repo_readme(
 
         ver_name = str(latest_pub.get("version_name") or "")
         ver_details = versions.get(ver_name) or next(iter(versions.values()), {})
-        pkg_info = ver_details.get("package", {}) if isinstance(ver_details, dict) else {}
+        if not isinstance(ver_details, dict):
+            ver_details = {}
 
-        clean_name = pkg_info.get("clean_name", package_name)
-        patched_pkg = pkg_info.get("patched_package_name", package_name)
-        arch = pkg_info.get("arch", "arm64-v8a")
-        tag = latest_pub.get("tag", f"{package_name}-v{ver_name}")
-        asset_name = latest_pub.get("asset_name", f"{package_name}-{ver_name}-{arch}-morphe.apk")
-        pub_at = str(latest_pub.get("published_at", ""))[:19].replace("T", " ")
-        dl_url = f"https://github.com/{repo}/releases/download/{quote(tag, safe='')}/{quote(asset_name, safe='')}"
+        pkg_info = ver_details.get("package", {})
+        file_info = ver_details.get("file", {})
+        patch_info = ver_details.get("patch", {})
 
-        rows.append(
-            f"| {clean_name} | `{patched_pkg}` | `{ver_name}` | `{arch}` | {pub_at} | [Download APK]({dl_url}) |"
-        )
+        clean_name = str(pkg_info.get("clean_name") or package_name)
+        patched_pkg = str(pkg_info.get("patched_package_name") or package_name)
+        version_code = pkg_info.get("patched_version_code") or pkg_info.get("source_version_code")
+        arch = str(pkg_info.get("arch") or "arm64-v8a")
+        min_sdk = pkg_info.get("min_sdk")
+        target_sdk = pkg_info.get("target_sdk")
+        size_bytes = file_info.get("size_bytes")
+        file_size = str(file_info.get("file_size") or _format_bytes(size_bytes))
+        sha256 = str(latest_pub.get("sha256") or file_info.get("sha256") or "")
+        cert_sha256 = latest_pub.get("cert_sha256")
+        morphe_ver = str(patch_info.get("morphe_desktop_version") or "Unknown")
+        repos = list(patch_info.get("repos") or [])
+        applied_patches = list(latest_pub.get("applied_patches") or _extract_applied_patches(ver_details))
+        slug = str(latest_pub.get("slug") or slugs.get(package_name, _slugify_label(package_name)))
+        tag = str(latest_pub.get("tag") or f"{slug}-v{ver_name}")
+        asset_name = str(latest_pub.get("asset_name") or f"{slug}-{ver_name}-{arch}-morphe.apk")
+        updated_at = str(latest_pub.get("published_at") or "")
+        release_url = str(latest_pub.get("release_url") or f"https://github.com/{repo}/releases/tag/{quote(tag, safe='')}")
+        apk_url = f"https://github.com/{repo}/releases/download/{quote(tag, safe='')}/{quote(asset_name, safe='')}"
+
+        records.append({
+            "slug": slug,
+            "clean_name": clean_name,
+            "package_name": package_name,
+            "patched_package_name": patched_pkg,
+            "version_name": ver_name,
+            "version_code": version_code,
+            "arch": arch,
+            "min_sdk": min_sdk,
+            "target_sdk": target_sdk,
+            "size_bytes": size_bytes,
+            "file_size": file_size,
+            "sha256": sha256,
+            "cert_sha256": cert_sha256,
+            "morphe_desktop_version": morphe_ver,
+            "repos": repos,
+            "applied_patches": applied_patches,
+            "updated_at": updated_at,
+            "tag": tag,
+            "asset_name": asset_name,
+            "release_url": release_url,
+            "apk_url": apk_url,
+        })
+
+    records.sort(key=lambda r: (r["clean_name"].lower(), r["package_name"].lower()))
+    return records
+
+
+def publish_repo_readme(
+    state_dir: Path,
+    patched_json: Path,
+    release_state: dict[str, Any],
+    repo: str,
+    token: str,
+    project_root: Path | None = None,
+    force: bool = False,
+) -> bool:
+    """
+    Generates and upserts `README.md` in the target builds repository with a
+    rich table of active, published APKs and collapsible per-app patch details.
+    Returns True if README.md was updated, False if skipped.
+    """
+    if not _parse_bool_env("GITHUB_RELEASE_UPDATE_README", default=True):
+        return False
+
+    records = _collect_active_published_records(patched_json, release_state, repo, project_root=project_root)
+    config_url = f"https://github.com/{repo}/releases/download/{CONFIG_RELEASE_TAG}/obtainium-github-export.json"
+
+    certs = {r["cert_sha256"] for r in records if r.get("cert_sha256")}
+    if len(certs) == 1:
+        cert_summary = f"`{next(iter(certs))}`"
+    elif len(certs) > 1:
+        cert_summary = "Per-app (see details below)"
+    else:
+        cert_summary = "N/A"
+
+    latest_ts = max((r["updated_at"] for r in records if r.get("updated_at")), default="")
+    last_updated_display = latest_ts[:19].replace("T", " ") + " UTC" if latest_ts else "N/A"
 
     lines = [
-        "# AutoMorph Builds",
+        "# AutoMorph Patched Builds",
         "",
         "Automated Android APK builds patched with AutoMorph & Morphe Desktop.",
         "",
@@ -811,19 +1003,65 @@ def publish_repo_readme(
         "",
         f"Import URL: `{config_url}`",
         "",
-        "> **Note:** `Verify Latest Tag` is pre-configured to `OFF` (`verifyLatestTag: false`) in this export so Obtainium tracks per-package tags cleanly.",
+        "> **Note:** `Verify Latest Tag` is pre-configured to `OFF` (`verifyLatestTag: false`) in this export so Obtainium tracks per-app `{slug}-v...` tags cleanly.",
         "",
-        "## Published Applications",
+        f"**Active Apps:** {len(records)} | **Last Updated:** {last_updated_display} | **Signing Certificate Fingerprint:** {cert_summary}",
         "",
-        "| App | Package | Version | Arch | Updated (UTC) | Download |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "## Available Builds",
+        "",
+        "| App | Package | Version | Size | Android SDK | Patches | Updated (UTC) | Download |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
-    if rows:
-        lines.extend(rows)
-    else:
-        lines.append("| *No active published builds* | - | - | - | - | - |")
 
-    readme_content = "\n".join(lines) + "\n"
+    if records:
+        for r in records:
+            ver_cell = f"`v{r['version_name']}`"
+            if r["version_code"] is not None:
+                ver_cell += f" (`{r['version_code']}`)"
+            if r["min_sdk"] is not None and r["target_sdk"] is not None:
+                sdk_cell = f"API {r['min_sdk']}–{r['target_sdk']}"
+            elif r["min_sdk"] is not None:
+                sdk_cell = f"API {r['min_sdk']}+"
+            else:
+                sdk_cell = "-"
+            patches_cell = f"{len(r['applied_patches'])} patches"
+            upd_cell = r["updated_at"][:19].replace("T", " ") if r["updated_at"] else "-"
+            lines.append(
+                f"| {r['clean_name']} | `{r['patched_package_name']}` | {ver_cell} | "
+                f"{r['file_size']} | {sdk_cell} | {patches_cell} | {upd_cell} | [APK]({r['apk_url']}) |"
+            )
+    else:
+        lines.append("| *No active published builds* | - | - | - | - | - | - | - |")
+
+    if records:
+        lines.extend(["", "## Per-App Build & Patch Details", ""])
+        for r in records:
+            esc_name = html.escape(r["clean_name"])
+            esc_pkg = html.escape(r["patched_package_name"])
+            esc_ver = html.escape(r["version_name"])
+            lines.append(
+                f"<details><summary><strong>{esc_name}</strong> (<code>{esc_pkg}</code> — v{esc_ver})</summary>"
+            )
+            lines.append("")
+            lines.append(f"- **Source Package:** `{r['package_name']}`")
+            lines.append(f"- **Patched Package:** `{r['patched_package_name']}`")
+            lines.append(f"- **Architecture:** `{r['arch']}`")
+            lines.append(f"- **Morphe Desktop:** `{r['morphe_desktop_version']}`")
+            repos_str = ", ".join(f"`{rp}`" for rp in r["repos"]) if r["repos"] else "N/A"
+            lines.append(f"- **Patch Repositories:** {repos_str}")
+            lines.append(f"- **APK SHA-256:** `{r['sha256']}`")
+            lines.append(f"- **Signing Cert SHA-256:** `{r['cert_sha256'] or 'N/A'}`")
+            lines.append("- **Applied Patches:**")
+            if r["applied_patches"]:
+                for p in r["applied_patches"]:
+                    lines.append(f"  - {p}")
+            else:
+                lines.append("  - None recorded")
+            lines.append("")
+            lines.append("</details>")
+            lines.append("")
+
+    readme_content = "\n".join(lines).rstrip() + "\n"
     readme_sha = hashlib.sha256(readme_content.encode("utf-8")).hexdigest()
 
     if not force and release_state.get("_readme", {}).get("sha256") == readme_sha:
@@ -831,32 +1069,157 @@ def publish_repo_readme(
         return False
 
     owner, repo_name = repo.split("/", 1)
-    headers = _github_headers(token)
-    contents_url = f"{GITHUB_API_BASE}/repos/{owner}/{repo_name}/contents/README.md"
-
-    existing_sha: str | None = None
-    get_resp = requests.get(contents_url, headers=headers, timeout=REQUEST_TIMEOUT)
-    if get_resp.status_code == 200:
-        existing_sha = get_resp.json().get("sha")
-    elif get_resp.status_code != 404:
-        get_resp.raise_for_status()
-
-    payload: dict[str, Any] = {
-        "message": "chore: update builds dashboard",
-        "content": base64.b64encode(readme_content.encode("utf-8")).decode("ascii"),
-    }
-    if existing_sha:
-        payload["sha"] = existing_sha
-
-    put_resp = requests.put(contents_url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
-    put_resp.raise_for_status()
+    committed = _upsert_repo_file(
+        owner=owner,
+        repo_name=repo_name,
+        file_path="README.md",
+        content_str=readme_content,
+        commit_message="chore: update builds dashboard",
+        token=token,
+    )
 
     release_state["_readme"] = {
         "sha256": readme_sha,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    logger.info(" └── [✓] Updated builds repository README.md dashboard.")
-    return True
+    if committed:
+        logger.info(" └── [✓] Updated builds repository README.md dashboard.")
+    return committed
+
+
+def publish_repo_changelog(
+    published_items: list[dict[str, Any]],
+    repo: str,
+    token: str,
+) -> bool:
+    """
+    Prepends a new UTC timestamped section to `CHANGELOG.md` in the builds
+    repository when `GITHUB_RELEASE_UPDATE_CHANGELOG` is enabled and new
+    releases were published, retaining the newest 50 sections.
+    """
+    if not _parse_bool_env("GITHUB_RELEASE_UPDATE_CHANGELOG", default=True):
+        return False
+    if not published_items:
+        return False
+
+    owner, repo_name = repo.split("/", 1)
+    _, existing = _get_repo_file(owner, repo_name, "CHANGELOG.md", token)
+
+    header = "# Changelog\n\nAutomated release history for patched APKs.\n\n"
+    existing_sections: list[str] = []
+    if existing:
+        parts = re.split(r"(?m)(?=^## )", existing)
+        for part in parts:
+            stripped = part.strip()
+            if stripped.startswith("## "):
+                existing_sections.append(stripped)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    entry_lines = [f"## {stamp} UTC", ""]
+    for item in published_items:
+        clean_name = item.get("clean_name") or item.get("package_name")
+        tag = item.get("tag", "")
+        asset_name = item.get("asset_name", "")
+        diff_summary = item.get("diff_summary", "New build")
+        apk_url = f"https://github.com/{repo}/releases/download/{quote(tag, safe='')}/{quote(asset_name, safe='')}"
+        entry_lines.append(f"- **{clean_name}** (`{tag}`) — {diff_summary} — [Download APK]({apk_url})")
+
+    new_section = "\n".join(entry_lines)
+    kept_sections = [new_section] + existing_sections[: MAX_CHANGELOG_SECTIONS - 1]
+    new_content = header + "\n\n".join(kept_sections).rstrip() + "\n"
+
+    committed = _upsert_repo_file(
+        owner=owner,
+        repo_name=repo_name,
+        file_path="CHANGELOG.md",
+        content_str=new_content,
+        commit_message="chore: update release changelog",
+        token=token,
+    )
+    if committed:
+        logger.info(" └── [✓] Updated builds repository CHANGELOG.md.")
+    return committed
+
+
+def publish_repo_catalog(
+    state_dir: Path,
+    patched_json: Path,
+    release_state: dict[str, Any],
+    repo: str,
+    token: str,
+    project_root: Path | None = None,
+    force: bool = False,
+) -> bool:
+    """
+    Generates `catalog.json` for active, non-excluded published apps and upserts
+    it to the builds repository when app metadata changes (ignoring `generated_at`).
+    """
+    if not _parse_bool_env("GITHUB_RELEASE_UPDATE_CATALOG", default=True):
+        return False
+
+    records = _collect_active_published_records(patched_json, release_state, repo, project_root=project_root)
+    config_url = f"https://github.com/{repo}/releases/download/{CONFIG_RELEASE_TAG}/obtainium-github-export.json"
+
+    apps_payload = [
+        {
+            "slug": r["slug"],
+            "name": r["clean_name"],
+            "source_package": r["package_name"],
+            "patched_package": r["patched_package_name"],
+            "version_name": r["version_name"],
+            "version_code": r["version_code"],
+            "arch": r["arch"],
+            "min_sdk": r["min_sdk"],
+            "target_sdk": r["target_sdk"],
+            "size_bytes": r["size_bytes"],
+            "file_size": r["file_size"],
+            "sha256": r["sha256"],
+            "cert_sha256": r["cert_sha256"],
+            "morphe_version": r["morphe_desktop_version"],
+            "patch_count": len(r["applied_patches"]),
+            "applied_patches": r["applied_patches"],
+            "tag": r["tag"],
+            "release_url": r["release_url"],
+            "apk_url": r["apk_url"],
+        }
+        for r in records
+    ]
+
+    stable_hash_input = json.dumps(
+        {"repo": repo, "obtainium_export_url": config_url, "apps": apps_payload},
+        sort_keys=True,
+    )
+    catalog_sha = hashlib.sha256(stable_hash_input.encode("utf-8")).hexdigest()
+
+    if not force and release_state.get("_catalog", {}).get("sha256") == catalog_sha:
+        logger.debug("Builds catalog.json unchanged; skipping GitHub Contents API update.")
+        return False
+
+    catalog_obj = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "repo": repo,
+        "obtainium_export_url": config_url,
+        "apps": apps_payload,
+    }
+    catalog_str = json.dumps(catalog_obj, indent=2) + "\n"
+
+    owner, repo_name = repo.split("/", 1)
+    committed = _upsert_repo_file(
+        owner=owner,
+        repo_name=repo_name,
+        file_path="catalog.json",
+        content_str=catalog_str,
+        commit_message="chore: update builds catalog",
+        token=token,
+    )
+
+    release_state["_catalog"] = {
+        "sha256": catalog_sha,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if committed:
+        logger.info(" └── [✓] Updated builds repository catalog.json.")
+    return committed
 
 
 def _dispatch_apprise(title: str, body: str) -> None:
@@ -885,26 +1248,42 @@ def _dispatch_apprise(title: str, body: str) -> None:
 
 def send_apprise_notification(published_items: list[dict[str, Any]], repo: str) -> None:
     """
-    Sends a concise notification via Apprise when APPRISE_URL is configured
-    and at least one new APK release was uploaded in this run.
+    Sends an adaptive Apprise notification: detailed when 1 app is published,
+    compact multi-app digest when multiple apps are published together.
     """
     apprise_url = os.getenv("APPRISE_URL", "").strip()
     if not apprise_url or not published_items:
         return
 
-    title = f"AutoMorph: {len(published_items)} new release(s) published"
-    lines = []
-    for item in published_items:
+    if len(published_items) == 1:
+        item = published_items[0]
         clean_name = item.get("clean_name") or item.get("package_name")
         version_name = item.get("version_name", "")
-        arch = item.get("arch", "")
         tag = item.get("tag", "")
-        diff_summary = item.get("diff_summary", "")
+        ver_trans = item.get("version_transition") or f"v{version_name}"
+        patch_diff = item.get("patch_diff_short") or "No patch changes"
         release_url = f"https://github.com/{repo}/releases/tag/{tag}"
-        diff_suffix = f" [{diff_summary}]" if diff_summary else ""
-        lines.append(f"- {clean_name} v{version_name} ({arch}){diff_suffix}: {release_url}")
 
-    _dispatch_apprise(title=title, body="\n".join(lines))
+        title = f"AutoMorph: {clean_name} v{version_name} released"
+        body = (
+            f"Version: {ver_trans}\n"
+            f"Patches: {patch_diff}\n"
+            f"Tag: {tag}\n"
+            f"Release: {release_url}"
+        )
+    else:
+        title = f"AutoMorph: {len(published_items)} apps released"
+        lines = []
+        for item in published_items:
+            clean_name = item.get("clean_name") or item.get("package_name")
+            version_name = item.get("version_name", "")
+            tag = item.get("tag", "")
+            compact_diff = item.get("diff_summary") or item.get("patch_diff_short") or "updated"
+            release_url = f"https://github.com/{repo}/releases/tag/{tag}"
+            lines.append(f"• {clean_name} v{version_name} ({compact_diff}) — {release_url}")
+        body = "\n".join(lines)
+
+    _dispatch_apprise(title=title, body=body)
 
 
 def send_apprise_failure_notification(
@@ -913,8 +1292,8 @@ def send_apprise_failure_notification(
     repo: str,
 ) -> None:
     """
-    Sends an Apprise alert when APPRISE_NOTIFY_ON_FAILURE is enabled and either
-    `patch_failures` or `cert_mismatches` is non-empty.
+    Sends an adaptive Apprise alert when APPRISE_NOTIFY_ON_FAILURE is enabled and
+    either `patch_failures` or `cert_mismatches` is non-empty.
     """
     if not _parse_bool_env("APPRISE_NOTIFY_ON_FAILURE", default=True):
         return
@@ -927,7 +1306,7 @@ def send_apprise_failure_notification(
     if not apprise_url:
         return
 
-    lines: list[str] = []
+    entries: list[tuple[str, str]] = []
     for pkg_name, fail_info in failures.items():
         if isinstance(fail_info, dict):
             targets = fail_info.get("target_versions") or []
@@ -936,22 +1315,26 @@ def send_apprise_failure_notification(
             stage = last_attempt.get("stage", "Pipeline")
             reason = last_attempt.get("reason", "Unknown failure")
             ver_str = str(targets[0][0]) if targets and isinstance(targets[0], (list, tuple)) else (str(targets[0]) if targets else "unknown")
-            lines.append(f"- [Build Failed] {pkg_name} (v{ver_str}) at {stage}: {reason}")
+            entries.append((pkg_name, f"Build failed (v{ver_str}) at {stage}: {reason}"))
         else:
-            lines.append(f"- [Build Failed] {pkg_name}: {fail_info}")
+            entries.append((pkg_name, f"Build failed: {fail_info}"))
 
     for mismatch in cert_mismatches:
-        pkg_name = mismatch.get("package_name", "unknown")
+        pkg_name = mismatch.get("clean_name") or mismatch.get("package_name", "unknown")
         ver_name = mismatch.get("version_name", "unknown")
         old_c = str(mismatch.get("old_cert", ""))[:12]
         new_c = str(mismatch.get("new_cert", ""))[:12]
-        lines.append(
-            f"- [Cert Mismatch] {pkg_name} v{ver_name}: upload blocked ({old_c}... != {new_c}...)"
-        )
+        entries.append((pkg_name, f"Cert mismatch (v{ver_name}): {old_c}... != {new_c}..."))
 
-    total = len(failures) + len(cert_mismatches)
-    title = f"AutoMorph: {total} failure/alert(s) in {repo}"
-    _dispatch_apprise(title=title, body="\n".join(lines))
+    if len(entries) == 1:
+        name, detail = entries[0]
+        title = f"AutoMorph: {name} failed"
+        body = f"Repository: {repo}\nDetail: {detail}"
+    else:
+        title = f"AutoMorph: {len(entries)} failures/alerts"
+        body = "\n".join(f"• {name} — {detail}" for name, detail in entries)
+
+    _dispatch_apprise(title=title, body=body)
 
 
 def main(
@@ -1000,6 +1383,7 @@ def main(
             send_apprise_failure_notification(patch_failures, cert_mismatches, repo)
             return {}
 
+        slugs = _resolve_app_slugs(patched_results)
         targets: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
 
@@ -1042,6 +1426,7 @@ def main(
                     force=force,
                     allow_cert_change=allow_cert_change,
                     cert_mismatches=cert_mismatches,
+                    slug=slugs.get(package_name),
                 )
                 if pub_result:
                     touched_packages.add(package_name)
@@ -1049,12 +1434,14 @@ def main(
                         published_items.append(pub_result)
                     else:
                         pkg_info = version_entry.get("package", {})
+                        slug = slugs.get(package_name, _slugify_label(package_name))
                         published_items.append({
                             "package_name": package_name,
+                            "slug": slug,
                             "clean_name": pkg_info.get("clean_name", package_name),
                             "version_name": version_name,
                             "arch": pkg_info.get("arch", "arm64-v8a"),
-                            "tag": f"{package_name}-v{version_name}",
+                            "tag": f"{slug}-v{version_name}",
                         })
             except Exception as e:
                 logger.error(f"[✗] Failed to publish GitHub Release for {package_name} v{version_name}: {e}")
@@ -1062,7 +1449,14 @@ def main(
         if keep > 0:
             for package_name in touched_packages:
                 try:
-                    prune_old_releases(package_name, repo, token, keep, release_state=release_state)
+                    prune_old_releases(
+                        package_name,
+                        repo,
+                        token,
+                        keep,
+                        release_state=release_state,
+                        slug=slugs.get(package_name),
+                    )
                 except Exception as e:
                     logger.error(f"[✗] Failed to prune old GitHub Releases for {package_name}: {e}")
 
@@ -1091,6 +1485,24 @@ def main(
             )
         except Exception as e:
             logger.error(f"[✗] Failed to update builds repository README.md: {e}")
+
+        try:
+            publish_repo_changelog(published_items, repo, token)
+        except Exception as e:
+            logger.error(f"[✗] Failed to update builds repository CHANGELOG.md: {e}")
+
+        try:
+            publish_repo_catalog(
+                state_dir=state_dir,
+                patched_json=patched_json,
+                release_state=release_state,
+                repo=repo,
+                token=token,
+                project_root=project_root,
+                force=force,
+            )
+        except Exception as e:
+            logger.error(f"[✗] Failed to update builds repository catalog.json: {e}")
 
         _write_json(release_state, state_file)
         send_apprise_notification(published_items, repo)
