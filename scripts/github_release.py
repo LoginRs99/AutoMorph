@@ -138,17 +138,41 @@ def _resolve_apk_path(
     package_name: str | None = None,
     version_name: str | None = None,
     project_root: Path | None = None,
+    state_dir: Path | None = None,
 ) -> Path | None:
-    """Returns the on-disk patched APK path for a version entry, or None if missing."""
+    """
+    Returns the on-disk patched APK path for a version entry, or None if missing.
+    Prioritizes `state_dir.parent / "apks"` (e.g. `tools/automorph-data/apks`)
+    before `apps/patched`, and rewrites stale `/apps/patched/` prefixes in
+    `file.location` when the APK exists under `apks/`.
+    """
+    apks_roots: list[Path] = []
+    if state_dir is not None:
+        apks_roots.append(state_dir.parent / "apks")
+    if project_root is not None:
+        default_apks = project_root / "tools" / "automorph-data" / "apks"
+        if default_apks not in apks_roots:
+            apks_roots.append(default_apks)
+
     if isinstance(entry, dict):
         loc = entry.get("file", {}).get("location")
-        if loc and Path(loc).is_file():
-            return Path(loc)
-    if project_root is not None and package_name and version_name:
-        for base_dir in (
-            project_root / "apps" / "patched" / package_name / version_name,
-            project_root / "tools" / "automorph-data" / "apks" / package_name / version_name,
-        ):
+        if loc:
+            loc_path = Path(loc)
+            if loc_path.is_file():
+                return loc_path
+            loc_posix = str(loc).replace("\\", "/")
+            if "/apps/patched/" in loc_posix:
+                rel_suffix = loc_posix.split("/apps/patched/", 1)[1].lstrip("/")
+                for apks_root in apks_roots:
+                    rewritten = apks_root / rel_suffix
+                    if rewritten.is_file():
+                        return rewritten
+
+    if package_name and version_name:
+        candidate_dirs: list[Path] = [root / package_name / version_name for root in apks_roots]
+        if project_root is not None:
+            candidate_dirs.append(project_root / "apps" / "patched" / package_name / version_name)
+        for base_dir in candidate_dirs:
             if not base_dir.is_dir():
                 continue
             exact = base_dir / f"{package_name}_{version_name}_patched.apk"
@@ -165,6 +189,7 @@ def _version_has_apk_on_disk(
     package_name: str | None = None,
     version_name: str | None = None,
     project_root: Path | None = None,
+    state_dir: Path | None = None,
 ) -> bool:
     """Returns True if the patched APK for this version entry exists on disk."""
     return (
@@ -173,6 +198,7 @@ def _version_has_apk_on_disk(
             package_name=package_name,
             version_name=version_name,
             project_root=project_root,
+            state_dir=state_dir,
         )
         is not None
     )
@@ -203,6 +229,7 @@ def _select_active_version_entry(
     versions: dict[str, Any],
     package_name: str | None = None,
     project_root: Path | None = None,
+    state_dir: Path | None = None,
 ) -> str | None:
     """
     Selects the newest version key whose patched APK actually exists on disk,
@@ -213,7 +240,13 @@ def _select_active_version_entry(
     on_disk = {
         ver: entry
         for ver, entry in versions.items()
-        if _version_has_apk_on_disk(entry, package_name=package_name, version_name=ver, project_root=project_root)
+        if _version_has_apk_on_disk(
+            entry,
+            package_name=package_name,
+            version_name=ver,
+            project_root=project_root,
+            state_dir=state_dir,
+        )
     }
     if on_disk:
         return _select_latest_version(on_disk)
@@ -223,6 +256,7 @@ def _select_active_version_entry(
 def _resolve_app_slugs(
     patched_results: dict[str, Any],
     project_root: Path | None = None,
+    state_dir: Path | None = None,
 ) -> dict[str, str]:
     """
     Maps each `package_name` in `patched_results` to a human-readable slug
@@ -233,7 +267,12 @@ def _resolve_app_slugs(
     for package_name, versions in patched_results.items():
         raw_clean = ""
         if isinstance(versions, dict) and versions:
-            latest_ver = _select_active_version_entry(versions, package_name=package_name, project_root=project_root)
+            latest_ver = _select_active_version_entry(
+                versions,
+                package_name=package_name,
+                project_root=project_root,
+                state_dir=state_dir,
+            )
             if latest_ver and isinstance(versions.get(latest_ver), dict):
                 raw_clean = str(versions[latest_ver].get("package", {}).get("clean_name") or "").strip()
         display_name = _resolve_display_name(package_name, raw_clean)
@@ -1022,6 +1061,8 @@ def publish_package(
     allow_cert_change: bool = False,
     cert_mismatches: list[dict[str, Any]] | None = None,
     slug: str | None = None,
+    project_root: Path | None = None,
+    state_dir: Path | None = None,
 ) -> dict[str, Any] | bool:
     """
     Upserts a GitHub Release for a single patched package version and streams
@@ -1037,13 +1078,18 @@ def publish_package(
     sha256 = file_info.get("sha256", "")
     apk_location = file_info.get("location")
 
-    if not apk_location:
-        logger.warning(f"[!] Skipping {package_name} (v{version_name}): missing APK file location in patched.json")
-        return False
-
-    apk_path = Path(apk_location)
-    if not apk_path.is_file():
-        logger.warning(f"[!] Skipping {package_name} (v{version_name}): APK file missing at {apk_path}")
+    apk_path = _resolve_apk_path(
+        version_entry,
+        package_name=package_name,
+        version_name=version_name,
+        project_root=project_root,
+        state_dir=state_dir,
+    )
+    if apk_path is None:
+        if not apk_location:
+            logger.warning(f"[!] Skipping {package_name} (v{version_name}): missing APK file location in patched.json")
+        else:
+            logger.warning(f"[!] Skipping {package_name} (v{version_name}): APK file missing at {apk_location}")
         return False
 
     inspected = _inspect_apk_manifest(apk_path)
@@ -1322,7 +1368,7 @@ def build_obtainium_github_export(
 
     active_packages = _get_active_packages(project_root) if project_root is not None else None
     excluded_packages = _get_excluded_packages()
-    slugs = _resolve_app_slugs(patched_results, project_root=project_root)
+    slugs = _resolve_app_slugs(patched_results, project_root=project_root, state_dir=state_dir)
 
     ob_export: dict[str, Any] = {"schemaVersion": 2, "apps": []}
 
@@ -1334,13 +1380,24 @@ def build_obtainium_github_export(
         if package_name in excluded_packages:
             continue
 
-        latest_version = _select_active_version_entry(versions, package_name=package_name, project_root=project_root)
+        latest_version = _select_active_version_entry(
+            versions,
+            package_name=package_name,
+            project_root=project_root,
+            state_dir=state_dir,
+        )
         if not latest_version:
             continue
 
         latest_details = versions[latest_version]
         pkg_info = latest_details.get("package", {})
-        apk_path = _resolve_apk_path(latest_details, package_name=package_name, version_name=latest_version, project_root=project_root)
+        apk_path = _resolve_apk_path(
+            latest_details,
+            package_name=package_name,
+            version_name=latest_version,
+            project_root=project_root,
+            state_dir=state_dir,
+        )
         inspected = _inspect_apk_manifest(apk_path) if apk_path else {}
         patched_package_name = str(inspected.get("package_name") or pkg_info.get("patched_package_name") or package_name)
         raw_clean = pkg_info.get("clean_name")
@@ -1455,12 +1512,14 @@ def _collect_active_published_records(
     release_state: dict[str, Any],
     repo: str,
     project_root: Path | None = None,
+    state_dir: Path | None = None,
 ) -> list[dict[str, Any]]:
     """Collects rich metadata records for all active, non-excluded published packages."""
+    resolved_state_dir = state_dir if state_dir is not None else patched_json.parent
     patched_results = _read_json(patched_json)
     active_packages = _get_active_packages(project_root) if project_root is not None else None
     excluded_packages = _get_excluded_packages()
-    slugs = _resolve_app_slugs(patched_results, project_root=project_root)
+    slugs = _resolve_app_slugs(patched_results, project_root=project_root, state_dir=resolved_state_dir)
 
     records: list[dict[str, Any]] = []
     for package_name, versions in patched_results.items():
@@ -1471,7 +1530,12 @@ def _collect_active_published_records(
         if package_name in excluded_packages:
             continue
 
-        active_ver = _select_active_version_entry(versions, package_name=package_name, project_root=project_root)
+        active_ver = _select_active_version_entry(
+            versions,
+            package_name=package_name,
+            project_root=project_root,
+            state_dir=resolved_state_dir,
+        )
         pkg_rel_state = release_state.get(package_name) if isinstance(release_state.get(package_name), dict) else {}
         if active_ver and isinstance(pkg_rel_state.get(active_ver), dict):
             latest_pub = {**pkg_rel_state[active_ver], "version_name": pkg_rel_state[active_ver].get("version_name") or active_ver}
@@ -1489,7 +1553,13 @@ def _collect_active_published_records(
         file_info = ver_details.get("file", {})
         patch_info = ver_details.get("patch", {})
 
-        apk_path = _resolve_apk_path(ver_details, package_name=package_name, version_name=ver_name, project_root=project_root)
+        apk_path = _resolve_apk_path(
+            ver_details,
+            package_name=package_name,
+            version_name=ver_name,
+            project_root=project_root,
+            state_dir=resolved_state_dir,
+        )
         inspected = _inspect_apk_manifest(apk_path) if apk_path else {}
         patched_pkg = str(
             inspected.get("package_name")
@@ -1573,7 +1643,7 @@ def publish_repo_readme(
     if not _parse_bool_env("GITHUB_RELEASE_UPDATE_README", default=True):
         return False
 
-    records = _collect_active_published_records(patched_json, release_state, repo, project_root=project_root)
+    records = _collect_active_published_records(patched_json, release_state, repo, project_root=project_root, state_dir=state_dir)
     config_url = f"https://github.com/{repo}/releases/download/{CONFIG_RELEASE_TAG}/obtainium-github-export.json"
 
     certs = {r["cert_sha256"] for r in records if r.get("cert_sha256")}
@@ -1762,7 +1832,7 @@ def publish_repo_catalog(
     if not _parse_bool_env("GITHUB_RELEASE_UPDATE_CATALOG", default=True):
         return False
 
-    records = _collect_active_published_records(patched_json, release_state, repo, project_root=project_root)
+    records = _collect_active_published_records(patched_json, release_state, repo, project_root=project_root, state_dir=state_dir)
     config_url = f"https://github.com/{repo}/releases/download/{CONFIG_RELEASE_TAG}/obtainium-github-export.json"
 
     apps_payload = [
@@ -1989,7 +2059,7 @@ def main(
             send_apprise_failure_notification(patch_failures, cert_mismatches, repo)
             return {}
 
-        slugs = _resolve_app_slugs(patched_results, project_root=project_root)
+        slugs = _resolve_app_slugs(patched_results, project_root=project_root, state_dir=state_dir)
         targets: list[tuple[str, str]] = []
         seen: set[tuple[str, str]] = set()
         active_versions: dict[str, str] = {}
@@ -1997,7 +2067,12 @@ def main(
         for package_name, details in (patched or {}).items():
             ver = details.get("version_name") if isinstance(details, dict) else None
             if not ver and package_name in patched_results:
-                ver = _select_active_version_entry(patched_results[package_name], package_name=package_name, project_root=project_root)
+                ver = _select_active_version_entry(
+                    patched_results[package_name],
+                    package_name=package_name,
+                    project_root=project_root,
+                    state_dir=state_dir,
+                )
             if ver and (package_name, ver) not in seen:
                 targets.append((package_name, ver))
                 seen.add((package_name, ver))
@@ -2015,7 +2090,12 @@ def main(
                 skipped_count += 1
                 logger.warning(f"[!] Skipping {package_name}: no version entries in patched.json")
                 continue
-            latest_ver = _select_active_version_entry(versions, package_name=package_name, project_root=project_root)
+            latest_ver = _select_active_version_entry(
+                versions,
+                package_name=package_name,
+                project_root=project_root,
+                state_dir=state_dir,
+            )
             if not latest_ver:
                 checked_count += 1
                 skipped_count += 1
@@ -2048,6 +2128,8 @@ def main(
                     allow_cert_change=allow_cert_change,
                     cert_mismatches=cert_mismatches,
                     slug=slugs.get(package_name),
+                    project_root=project_root,
+                    state_dir=state_dir,
                 )
                 if pub_result:
                     touched_packages.add(package_name)
