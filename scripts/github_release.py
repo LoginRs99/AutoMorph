@@ -684,6 +684,21 @@ def _compute_release_diff(
     }
 
 
+def _shields_badge(label: str, value: str, color: str) -> str:
+    """Formats a Shields.io flat-square badge URL with proper escaping."""
+    esc_label = quote(str(label).replace("-", "--").replace("_", "__"), safe="")
+    esc_val = quote(str(value).replace("-", "--").replace("_", "__"), safe="")
+    return f"https://img.shields.io/badge/{esc_label}-{esc_val}-{color}?style=flat-square"
+
+
+def _format_repo_link(repo_url: str) -> str:
+    """Formats a repository URL as a clickable `[owner/repo](url)` Markdown link."""
+    url = str(repo_url or "").strip().rstrip("/")
+    m = re.search(r"https?://[^/]+/([^/]+/[^/]+)$", url)
+    label = m.group(1) if m else url
+    return f"[{label}]({url})" if url.startswith(("http://", "https://")) else f"`{label}`"
+
+
 def _build_release_body(
     package_name: str,
     version_name: str,
@@ -691,55 +706,178 @@ def _build_release_body(
     diff_info: dict[str, Any] | None = None,
     cert_sha256: str | None = None,
     patched_package_name: str | None = None,
+    slug: str | None = None,
+    repo: str | None = None,
+    tag: str | None = None,
+    asset_name: str | None = None,
+    obtainium_deeplink: str | None = None,
+    inspected_manifest: dict[str, Any] | None = None,
 ) -> str:
-    """Formats a Markdown release summary from a patched.json version entry."""
+    """Formats a compact, badge-driven GitHub Release card for a patched APK."""
     pkg_info = version_entry.get("package", {})
     file_info = version_entry.get("file", {})
     meta_info = version_entry.get("metadata", {})
+    patch_info = version_entry.get("patch", {})
+    inspected = inspected_manifest or {}
 
-    clean_name = _resolve_display_name(package_name, pkg_info.get("clean_name"))
-    patched_pkg = patched_package_name or pkg_info.get("patched_package_name") or package_name
-    arch = pkg_info.get("arch", "unknown")
-    sha256 = file_info.get("sha256", "unknown")
-    build_time = meta_info.get("time", "unknown")
+    patched_pkg = str(
+        patched_package_name
+        or inspected.get("package_name")
+        or pkg_info.get("patched_package_name")
+        or package_name
+    )
+    raw_clean = pkg_info.get("clean_name")
+    if (
+        not raw_clean
+        or str(raw_clean).strip().lower() in (package_name.lower(), patched_pkg.lower())
+    ) and inspected.get("application_label"):
+        raw_clean = inspected["application_label"]
+    clean_name = _resolve_display_name(package_name, raw_clean)
+    resolved_slug = slug or _slugify_label(clean_name) or _slugify_label(package_name) or package_name.lower()
+
+    arch = str(pkg_info.get("arch") or "arm64-v8a")
+    version_code = (
+        inspected.get("version_code")
+        or pkg_info.get("patched_version_code")
+        or pkg_info.get("source_version_code")
+    )
+    min_sdk = inspected.get("min_sdk") if inspected.get("min_sdk") is not None else pkg_info.get("min_sdk")
+    target_sdk = inspected.get("target_sdk") if inspected.get("target_sdk") is not None else pkg_info.get("target_sdk")
+    file_size = str(file_info.get("file_size") or _format_bytes(file_info.get("size_bytes")))
+    sha256 = str(file_info.get("sha256") or "unknown")
+    build_time = str(meta_info.get("time") or "unknown")
+    morphe_version = str(patch_info.get("morphe_desktop_version") or "Unknown")
+    repos = list(patch_info.get("repos") or [])
     applied_patches = _extract_applied_patches(version_entry)
 
-    lines = [f"### {clean_name}", ""]
+    resolved_tag = tag or f"{resolved_slug}-v{version_name}"
+    resolved_asset = asset_name or f"{resolved_slug}-{version_name}-{arch}-morphe.apk"
 
-    if diff_info:
-        lines.append("#### What Changed")
-        lines.append(f"- **Version:** {diff_info['version_transition']}")
-        if diff_info.get("is_initial"):
-            lines.append(f"- **Patches:** {len(applied_patches)} patch(es) enabled")
-        elif diff_info.get("added_patches") or diff_info.get("removed_patches"):
-            for p in diff_info.get("added_patches", []):
-                lines.append(f"  - `+ {p}`")
-            for p in diff_info.get("removed_patches", []):
-                lines.append(f"  - `- {p}`")
-        else:
-            lines.append("- **Patches:** No patch list changes")
-        lines.append("")
+    if not obtainium_deeplink and repo:
+        obtainium_deeplink = _build_obtainium_deeplink(
+            _build_obtainium_app_entry(
+                patched_package_name=patched_pkg,
+                clean_name=clean_name,
+                slug=resolved_slug,
+                latest_version=version_name,
+                repo=repo,
+            )
+        )
 
-    lines.extend([
-        "#### Build Details",
-        f"- **App Name:** {clean_name}",
-        f"- **Package ID:** `{patched_pkg}` (source: `{package_name}`)",
-        f"- **Version:** `{version_name}`",
-        f"- **Architecture:** `{arch}`",
-        f"- **APK SHA-256:** `{sha256}`",
-    ])
-    if cert_sha256:
-        lines.append(f"- **Signing Cert SHA-256:** `{cert_sha256}`")
-    lines.extend([
-        f"- **Build Timestamp:** {build_time}",
+    badges = [
+        f"![Version]({_shields_badge('Version', f'v{version_name}', '20cfce')})",
+        f"![Package ID]({_shields_badge('Package ID', patched_pkg, '6366F1')})",
+        f"![Arch]({_shields_badge('Arch', arch, '4A7FC8')})",
+        f"![Patches]({_shields_badge('Patches', str(len(applied_patches)), '10B981')})",
+    ]
+    if file_size and file_size != "-":
+        badges.append(f"![Size]({_shields_badge('Size', file_size, '64748B')})")
+
+    lines = [
+        f"### {clean_name}",
         "",
-        "#### Applied Patches",
+        " ".join(badges),
+        "",
+    ]
+
+    if repo:
+        apk_url = f"https://github.com/{repo}/releases/download/{quote(resolved_tag, safe='')}/{quote(resolved_asset, safe='')}"
+        lines.extend([
+            f"**[📲 Add to Obtainium]({obtainium_deeplink})** · "
+            f"**[⬇ Download APK]({apk_url})** · "
+            f"**[🏠 Builds Dashboard](https://github.com/{repo}#readme)**",
+            "",
+        ])
+    elif obtainium_deeplink:
+        lines.extend([
+            f"**[📲 Add to Obtainium]({obtainium_deeplink})**",
+            "",
+        ])
+
+    lines.append("> [!NOTE]")
+    if diff_info:
+        ver_trans = diff_info.get("version_transition", f"v{version_name}")
+        added = list(diff_info.get("added_patches") or [])
+        removed = list(diff_info.get("removed_patches") or [])
+        if diff_info.get("is_initial"):
+            lines.append(f"> **Build Delta:** {ver_trans} · {len(applied_patches)} patch(es) enabled")
+        elif added or removed:
+            lines.append(f"> **Build Delta:** {ver_trans} · **+{len(added)} added, -{len(removed)} removed**")
+            inline_changes = [f"`+ {p}`" for p in added] + [f"`- {p}`" for p in removed]
+            shown = inline_changes[:8]
+            extra = len(inline_changes) - len(shown)
+            suffix = f" *(+{extra} more)*" if extra > 0 else ""
+            lines.append(f"> {', '.join(shown)}{suffix}")
+        else:
+            lines.append(f"> **Build Delta:** {ver_trans} · No patch changes")
+    else:
+        lines.append(f"> **Build:** `v{version_name}` · {len(applied_patches)} patch(es) applied")
+    lines.append("")
+
+    pkg_cell = f"`{patched_pkg}`"
+    if patched_pkg != package_name:
+        pkg_cell += f" *(source: `{package_name}`)*"
+
+    if min_sdk is not None and target_sdk is not None:
+        sdk_str = f"API {min_sdk}–{target_sdk}"
+    elif min_sdk is not None:
+        sdk_str = f"API {min_sdk}+"
+    else:
+        sdk_str = "N/A"
+    vc_str = f"`{version_code}`" if version_code is not None else "`N/A`"
+
+    sources_str = " · ".join(_format_repo_link(r) for r in repos) if repos else "N/A"
+    lines.extend([
+        "| Spec | Value |",
+        "| --- | --- |",
+        f"| **Patched Package ID** | {pkg_cell} |",
+        f"| **Version Code & SDK** | {vc_str} · {sdk_str} |",
+        f"| **Patcher & Sources** | Morphe `{morphe_version}` · {sources_str} |",
+        "",
+        f"<details><summary><strong>🧩 Applied Patches ({len(applied_patches)})</strong></summary>",
+        "",
     ])
-    if applied_patches:
-        for patch_name in applied_patches:
-            lines.append(f"- {patch_name}")
+
+    raw_applied = patch_info.get("applied_patches")
+    if isinstance(raw_applied, dict) and raw_applied:
+        grouped: dict[str, list[str]] = {}
+        for pname, pmeta in raw_applied.items():
+            repo_label = str(pmeta.get("repo") or "Default") if isinstance(pmeta, dict) else "Default"
+            grouped.setdefault(repo_label, []).append(str(pname))
+        if len(grouped) > 1:
+            for repo_label in sorted(grouped):
+                lines.append(f"**{repo_label}**")
+                for pname in sorted(grouped[repo_label]):
+                    lines.append(f"- {pname}")
+                lines.append("")
+        else:
+            for pname in applied_patches:
+                lines.append(f"- {pname}")
+    elif applied_patches:
+        for pname in applied_patches:
+            lines.append(f"- {pname}")
     else:
         lines.append("- None recorded")
+
+    lines.extend([
+        "",
+        "</details>",
+        "",
+        "<details><summary><strong>🔐 Checksums &amp; Signing Certificate</strong></summary>",
+        "",
+        "| Check | Value |",
+        "| --- | --- |",
+        f"| **APK SHA-256** | `{sha256}` |",
+        f"| **Signing Cert SHA-256** | `{cert_sha256 or 'N/A'}` |",
+        f"| **Build Timestamp** | `{build_time}` |",
+        "",
+        "```bash",
+        f"sha256sum {resolved_asset}",
+        f"apksigner verify --print-certs {resolved_asset}",
+        "```",
+        "",
+        "</details>",
+    ])
 
     return "\n".join(lines) + "\n"
 
@@ -960,6 +1098,15 @@ def publish_package(
     tag = f"{resolved_slug}-v{version_name}"
     asset_name = f"{resolved_slug}-{version_name}-{arch}-morphe.apk"
     title = f"{clean_name} v{version_name} ({arch})"
+    obtainium_deeplink = _build_obtainium_deeplink(
+        _build_obtainium_app_entry(
+            patched_package_name=patched_pkg,
+            clean_name=clean_name,
+            slug=resolved_slug,
+            latest_version=version_name,
+            repo=repo,
+        )
+    )
     body = _build_release_body(
         package_name,
         version_name,
@@ -967,6 +1114,12 @@ def publish_package(
         diff_info=diff_info,
         cert_sha256=new_cert_sha256,
         patched_package_name=patched_pkg,
+        slug=resolved_slug,
+        repo=repo,
+        tag=tag,
+        asset_name=asset_name,
+        obtainium_deeplink=obtainium_deeplink,
+        inspected_manifest=inspected,
     )
 
     release_id, release_url = _upsert_release_and_upload(
@@ -1234,15 +1387,45 @@ def publish_obtainium_config_release(
             logger.debug("obtainium-github-export.json unchanged; skipping automorph-config release upload.")
             return
 
-    body = (
-        "AutoMorph Obtainium configuration export (`obtainium-github-export.json`).\n\n"
-        "### Setup Notes\n"
-        "- Import `obtainium-github-export.json` in Obtainium (**Import/Export -> Obtainium Import**).\n"
-        "- Each app has **Verify Latest Tag: OFF** (`verifyLatestTag: false`) so Obtainium resolves "
-        "per-package `{slug}-v...` tags in a shared repository.\n"
-        "- If this repository is **private**, configure a GitHub Personal Access Token (PAT) with "
-        "`Contents: Read` permission in Obtainium (**Settings -> Source-Specific -> GitHub PAT**).\n"
-    )
+    export_data = _read_json(export_path)
+    apps = export_data.get("apps") if isinstance(export_data.get("apps"), list) else []
+    config_url = f"https://github.com/{repo}/releases/download/{CONFIG_RELEASE_TAG}/{export_path.name}"
+
+    badges = [
+        f"![Active Apps]({_shields_badge('Active Apps', str(len(apps)), '20cfce')})",
+        f"![Format]({_shields_badge('Format', 'Obtainium v1.x Export', '6366F1')})",
+    ]
+    body_lines = [
+        "### AutoMorph Obtainium Config",
+        "",
+        " ".join(badges),
+        "",
+        f"**[⬇ Download `{export_path.name}`]({config_url})** · **[🏠 Builds Dashboard](https://github.com/{repo}#readme)**",
+        "",
+        "### Quick Phone Import (3 Steps)",
+        f"1. Download [`{export_path.name}`]({config_url}) onto your Android device.",
+        "2. Open **Obtainium → Import/Export → Obtainium Import** and select the JSON file.",
+        "3. *(Private repo only)* Add a read-only GitHub PAT (`Contents: Read`) under **Settings → Source-Specific → GitHub PAT**.",
+        "",
+        "| Name | Patched Package ID | Tag Filter |",
+        "| --- | --- | --- |",
+    ]
+    if apps:
+        for app in apps:
+            if not isinstance(app, dict):
+                continue
+            app_name = str(app.get("name") or app.get("id") or "Unknown")
+            app_id = str(app.get("id") or "")
+            try:
+                settings = json.loads(app.get("additionalSettings") or "{}")
+            except Exception:
+                settings = {}
+            tag_filter = str(settings.get("filterReleasesByRegEx") or "")
+            body_lines.append(f"| **{app_name}** | `{app_id}` | `{tag_filter}` |")
+    else:
+        body_lines.append("| *No active apps* | - | - |")
+
+    body = "\n".join(body_lines) + "\n"
 
     release_id, release_url = _upsert_release_and_upload(
         repo=repo,
