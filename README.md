@@ -114,7 +114,7 @@ docker compose -f default_compose.yaml pull && docker compose -f default_compose
 | --- | --- | --- | --- |
 | `GITHUB_RELEASE_REPO` | *(empty / disabled)* | Target `owner/repo` for APK releases | `LoginRs99/automorph-builds` |
 | `GITHUB_RELEASE_TOKEN` | *(falls back to `GITHUB_TOKEN`)* | Fine-grained PAT (`Contents: Read and write`) | `github_pat_...` |
-| `GITHUB_RELEASE_KEEP` | `2` | Max releases kept per package (`<= 0` disables pruning) | `2` |
+| `GITHUB_RELEASE_KEEP` | `1` | Max releases kept per package (`<= 0` disables pruning) | `1` |
 | `GITHUB_RELEASE_PUBLISH_CONFIG` | `true` | Upload `obtainium-github-export.json` to `automorph-config` | `true` |
 | `GITHUB_RELEASE_EXCLUDE` | *(empty)* | Comma-separated packages omitted from Obtainium export | `com.example.private` |
 | `GITHUB_RELEASE_SYNC_ALL` | `false` | Catch up un-published latest versions in `patched.json` | `false` |

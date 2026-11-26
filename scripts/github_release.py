@@ -18,9 +18,12 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import struct
+import subprocess
 from typing import Any
 from urllib.parse import quote
+import zipfile
 
 from dotenv import load_dotenv
 import requests
@@ -71,7 +74,7 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("true", "1", "yes")
 
 
-def _parse_keep_env(default: int = 2) -> int:
+def _parse_keep_env(default: int = 1) -> int:
     raw = os.getenv("GITHUB_RELEASE_KEEP")
     if raw is None or not raw.strip():
         return default
@@ -130,6 +133,33 @@ def _parse_version_tuple(ver_str: str) -> tuple[int, ...]:
     return tuple(nums) if nums else (0,)
 
 
+def _resolve_apk_path(
+    entry: Any,
+    package_name: str | None = None,
+    version_name: str | None = None,
+    project_root: Path | None = None,
+) -> Path | None:
+    """Returns the on-disk patched APK path for a version entry, or None if missing."""
+    if isinstance(entry, dict):
+        loc = entry.get("file", {}).get("location")
+        if loc and Path(loc).is_file():
+            return Path(loc)
+    if project_root is not None and package_name and version_name:
+        for base_dir in (
+            project_root / "apps" / "patched" / package_name / version_name,
+            project_root / "tools" / "automorph-data" / "apks" / package_name / version_name,
+        ):
+            if not base_dir.is_dir():
+                continue
+            exact = base_dir / f"{package_name}_{version_name}_patched.apk"
+            if exact.is_file():
+                return exact
+            matched = next(base_dir.glob("*_patched.apk"), None)
+            if matched and matched.is_file():
+                return matched
+    return None
+
+
 def _version_has_apk_on_disk(
     entry: Any,
     package_name: str | None = None,
@@ -137,22 +167,15 @@ def _version_has_apk_on_disk(
     project_root: Path | None = None,
 ) -> bool:
     """Returns True if the patched APK for this version entry exists on disk."""
-    if isinstance(entry, dict):
-        loc = entry.get("file", {}).get("location")
-        if loc and Path(loc).is_file():
-            return True
-    if project_root is not None and package_name and version_name:
-        candidate = (
-            project_root
-            / "apps"
-            / "patched"
-            / package_name
-            / version_name
-            / f"{package_name}_{version_name}_patched.apk"
+    return (
+        _resolve_apk_path(
+            entry,
+            package_name=package_name,
+            version_name=version_name,
+            project_root=project_root,
         )
-        if candidate.is_file():
-            return True
-    return False
+        is not None
+    )
 
 
 def _select_latest_version(versions: dict[str, Any]) -> str | None:
@@ -387,6 +410,188 @@ def _extract_apk_cert_sha256(apk_path: Path) -> str | None:
         return None
 
 
+def _read_axml_utf8_len(data: bytes, pos: int) -> tuple[int, int]:
+    """Reads a 1- or 2-byte length prefix used in UTF-8 AXML string pools."""
+    val = data[pos]
+    pos += 1
+    if val & 0x80:
+        val = ((val & 0x7F) << 8) | data[pos]
+        pos += 1
+    return val, pos
+
+
+def _parse_axml_string_pool(data: bytes, offset: int, chunk_hdr_size: int, chunk_size: int) -> list[str]:
+    """Parses a binary Android XML RES_STRING_POOL_TYPE (0x0001) chunk."""
+    if offset + 28 > len(data) or offset + chunk_size > len(data):
+        return []
+    string_count, _style_count, flags, strings_start, _styles_start = struct.unpack_from(
+        "<IIIII", data, offset + 8
+    )
+    is_utf8 = bool(flags & 0x100)
+    offsets_base = offset + chunk_hdr_size
+    pool_base = offset + strings_start
+    pool_end = offset + chunk_size
+    if offsets_base + string_count * 4 > pool_end:
+        return []
+
+    strings: list[str] = []
+    for i in range(string_count):
+        str_rel = struct.unpack_from("<I", data, offsets_base + i * 4)[0]
+        pos = pool_base + str_rel
+        if pos >= pool_end:
+            strings.append("")
+            continue
+        if is_utf8:
+            _, pos = _read_axml_utf8_len(data, pos)
+            byte_len, pos = _read_axml_utf8_len(data, pos)
+            raw = data[pos : min(pos + byte_len, pool_end)]
+            strings.append(raw.decode("utf-8", errors="replace"))
+        else:
+            if pos + 2 > pool_end:
+                strings.append("")
+                continue
+            u16_len = struct.unpack_from("<H", data, pos)[0]
+            pos += 2
+            if u16_len & 0x8000:
+                if pos + 2 > pool_end:
+                    strings.append("")
+                    continue
+                low = struct.unpack_from("<H", data, pos)[0]
+                u16_len = ((u16_len & 0x7FFF) << 16) | low
+                pos += 2
+            raw = data[pos : min(pos + u16_len * 2, pool_end)]
+            strings.append(raw.decode("utf-16-le", errors="replace"))
+    return strings
+
+
+def _parse_binary_axml_manifest(data: bytes) -> dict[str, Any]:
+    """
+    Pure-Python parser for binary AndroidManifest.xml (AXML) extracting
+    package_name, version_code, version_name, application_label, min_sdk, target_sdk.
+    """
+    if len(data) < 8:
+        return {}
+    root_type, root_hdr_size, _root_size = struct.unpack_from("<HHI", data, 0)
+    if root_type != 0x0003:
+        return {}
+
+    strings: list[str] = []
+    result: dict[str, Any] = {}
+    offset = root_hdr_size
+    total_len = len(data)
+
+    while offset + 8 <= total_len:
+        chunk_type, chunk_hdr_size, chunk_size = struct.unpack_from("<HHI", data, offset)
+        if chunk_size < 8 or offset + chunk_size > total_len:
+            break
+
+        if chunk_type == 0x0001 and not strings:
+            strings = _parse_axml_string_pool(data, offset, chunk_hdr_size, chunk_size)
+        elif chunk_type == 0x0102 and offset + 36 <= offset + chunk_size:
+            _ns_idx, name_idx, attr_start, attr_size, attr_count = struct.unpack_from(
+                "<iiHHH", data, offset + 16
+            )
+            elem_name = strings[name_idx] if 0 <= name_idx < len(strings) else ""
+            attrs_pos = offset + 16 + attr_start
+            if attr_size >= 20 and elem_name in ("manifest", "uses-sdk", "application"):
+                for i in range(attr_count):
+                    apos = attrs_pos + i * attr_size
+                    if apos + 20 > offset + chunk_size:
+                        break
+                    _a_ns, a_name_idx, a_raw_idx = struct.unpack_from("<iii", data, apos)
+                    _tv_size, _tv_res0, tv_type, tv_data = struct.unpack_from("<HBBi", data, apos + 12)
+                    a_name = strings[a_name_idx] if 0 <= a_name_idx < len(strings) else ""
+
+                    str_val: str | None = None
+                    if 0 <= a_raw_idx < len(strings):
+                        str_val = strings[a_raw_idx]
+                    elif tv_type == 0x03 and 0 <= tv_data < len(strings):
+                        str_val = strings[tv_data]
+
+                    int_val: int | None = tv_data if tv_type in (0x10, 0x11) else None
+                    if int_val is None and str_val and str_val.isdigit():
+                        int_val = int(str_val)
+
+                    if elem_name == "manifest":
+                        if a_name == "package" and str_val:
+                            result["package_name"] = str_val
+                        elif a_name == "versionCode" and int_val is not None:
+                            result["version_code"] = int_val
+                        elif a_name == "versionName" and str_val is not None:
+                            result["version_name"] = str_val
+                    elif elem_name == "uses-sdk":
+                        if a_name == "minSdkVersion" and int_val is not None:
+                            result["min_sdk"] = int_val
+                        elif a_name == "targetSdkVersion" and int_val is not None:
+                            result["target_sdk"] = int_val
+                    elif elem_name == "application":
+                        if a_name == "label" and str_val and not str_val.startswith("@"):
+                            result["application_label"] = str_val
+
+        offset += chunk_size
+
+    return result
+
+
+def _inspect_apk_manifest(apk_path: Path) -> dict[str, Any]:
+    """
+    Inspects an APK's manifest to extract true package_name, version_code,
+    version_name, application_label, min_sdk, and target_sdk.
+    Uses `aapt2`/`aapt` dump badging when available, falling back to pure-Python
+    binary AndroidManifest.xml (AXML) parsing.
+    """
+    if not apk_path or not apk_path.is_file():
+        return {}
+
+    for tool in ("aapt2", "aapt"):
+        tool_path = shutil.which(tool)
+        if not tool_path:
+            continue
+        try:
+            proc = subprocess.run(
+                [tool_path, "dump", "badging", str(apk_path)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                parsed: dict[str, Any] = {}
+                pkg_m = re.search(r"package:\s+name='([^']+)'", proc.stdout)
+                if pkg_m:
+                    parsed["package_name"] = pkg_m.group(1)
+                vc_m = re.search(r"versionCode='(\d+)'", proc.stdout)
+                if vc_m:
+                    parsed["version_code"] = int(vc_m.group(1))
+                vn_m = re.search(r"versionName='([^']*)'", proc.stdout)
+                if vn_m:
+                    parsed["version_name"] = vn_m.group(1)
+                lbl_m = re.search(r"application-label:'([^']*)'", proc.stdout) or re.search(
+                    r"application-label-[^:]+:'([^']*)'", proc.stdout
+                )
+                if lbl_m and lbl_m.group(1):
+                    parsed["application_label"] = lbl_m.group(1)
+                sdk_m = re.search(r"sdkVersion:'(\d+)'", proc.stdout)
+                if sdk_m:
+                    parsed["min_sdk"] = int(sdk_m.group(1))
+                tsdk_m = re.search(r"targetSdkVersion:'(\d+)'", proc.stdout)
+                if tsdk_m:
+                    parsed["target_sdk"] = int(tsdk_m.group(1))
+                if parsed.get("package_name"):
+                    return parsed
+        except Exception as e:
+            logger.debug(f"{tool} dump badging failed for {apk_path.name}: {e}")
+
+    try:
+        with zipfile.ZipFile(apk_path, "r") as zf:
+            if "AndroidManifest.xml" in zf.namelist():
+                return _parse_binary_axml_manifest(zf.read("AndroidManifest.xml"))
+    except Exception as e:
+        logger.debug(f"Failed to inspect binary AndroidManifest.xml in {apk_path.name}: {e}")
+
+    return {}
+
+
 def _get_latest_published_entry(
     release_state: dict[str, Any],
     package_name: str,
@@ -485,6 +690,7 @@ def _build_release_body(
     version_entry: dict[str, Any],
     diff_info: dict[str, Any] | None = None,
     cert_sha256: str | None = None,
+    patched_package_name: str | None = None,
 ) -> str:
     """Formats a Markdown release summary from a patched.json version entry."""
     pkg_info = version_entry.get("package", {})
@@ -492,7 +698,7 @@ def _build_release_body(
     meta_info = version_entry.get("metadata", {})
 
     clean_name = _resolve_display_name(package_name, pkg_info.get("clean_name"))
-    patched_pkg = pkg_info.get("patched_package_name", package_name)
+    patched_pkg = patched_package_name or pkg_info.get("patched_package_name") or package_name
     arch = pkg_info.get("arch", "unknown")
     sha256 = file_info.get("sha256", "unknown")
     build_time = meta_info.get("time", "unknown")
@@ -702,6 +908,13 @@ def publish_package(
         logger.warning(f"[!] Skipping {package_name} (v{version_name}): APK file missing at {apk_path}")
         return False
 
+    inspected = _inspect_apk_manifest(apk_path)
+    patched_pkg = str(inspected.get("package_name") or pkg_info.get("patched_package_name") or package_name)
+    raw_clean = pkg_info.get("clean_name")
+    if (not raw_clean or str(raw_clean).strip().lower() in (package_name.lower(), patched_pkg.lower())) and inspected.get("application_label"):
+        raw_clean = inspected["application_label"]
+    clean_name = _resolve_display_name(package_name, raw_clean)
+
     resolved_slug = slug or _slugify_label(clean_name) or _slugify_label(package_name) or package_name.lower()
 
     existing_entry = release_state.get(package_name, {}).get(version_name)
@@ -753,6 +966,7 @@ def publish_package(
         version_entry,
         diff_info=diff_info,
         cert_sha256=new_cert_sha256,
+        patched_package_name=patched_pkg,
     )
 
     release_id, release_url = _upsert_release_and_upload(
@@ -770,6 +984,7 @@ def publish_package(
     release_state.setdefault(package_name, {})[version_name] = {
         "sha256": sha256,
         "cert_sha256": new_cert_sha256,
+        "patched_package_name": patched_pkg,
         "slug": resolved_slug,
         "version_name": version_name,
         "applied_patches": applied_patches,
@@ -782,6 +997,7 @@ def publish_package(
     logger.info(f" └── [✓] Published GitHub Release {tag} ({asset_name})")
     return {
         "package_name": package_name,
+        "patched_package_name": patched_pkg,
         "slug": resolved_slug,
         "clean_name": clean_name,
         "version_name": version_name,
@@ -802,12 +1018,14 @@ def prune_old_releases(
     release_state: dict[str, Any] | None = None,
     slug: str | None = None,
     active_version: str | None = None,
+    patched_package_name: str | None = None,
 ) -> list[str]:
     """
     Deletes GitHub Releases (and their git tags) for `package_name` beyond
-    the newest `keep` releases, matching `{slug}-v`, `{package_name}-v`, and
-    `{_slugify_label(package_name)}-v`. When `active_version` is provided and
-    `keep >= 1`, also deletes any higher/superseded release (rollback cleanup).
+    the newest `keep` releases, matching `{slug}-v`, `{package_name}-v`,
+    `{patched_package_name}-v`, and `{_slugify_label(package_name)}-v`.
+    When `active_version` is provided and `keep >= 1`, also deletes any
+    higher/superseded release (rollback cleanup) while preserving `active_version`.
     Returns a list of deleted tag names.
     """
     if keep <= 0:
@@ -820,7 +1038,7 @@ def prune_old_releases(
     resp.raise_for_status()
 
     prefixes: list[str] = []
-    for candidate in (slug, package_name, _slugify_label(package_name)):
+    for candidate in (slug, package_name, patched_package_name, _slugify_label(package_name)):
         if candidate:
             p = f"{candidate}-v"
             if p not in prefixes:
@@ -850,6 +1068,9 @@ def prune_old_releases(
             to_delete.append(rel)
         else:
             kept_candidates.append(rel)
+
+    if active_version:
+        kept_candidates.sort(key=lambda r: _extract_rel_version(str(r.get("tag_name", ""))) == active_version, reverse=True)
 
     to_delete.extend(kept_candidates[keep:])
 
@@ -928,7 +1149,7 @@ def _build_obtainium_app_entry(
 def _build_obtainium_deeplink(app_entry: dict[str, Any]) -> str:
     """Returns an Obtainium HTTPS redirect URL for 1-click single-app import."""
     encoded = quote(json.dumps(app_entry, separators=(",", ":")), safe="")
-    return f"https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/{encoded}"
+    return f"https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/{encoded}"
 
 
 def build_obtainium_github_export(
@@ -966,8 +1187,13 @@ def build_obtainium_github_export(
 
         latest_details = versions[latest_version]
         pkg_info = latest_details.get("package", {})
-        patched_package_name = pkg_info.get("patched_package_name") or package_name
-        clean_name = _resolve_display_name(package_name, pkg_info.get("clean_name"))
+        apk_path = _resolve_apk_path(latest_details, package_name=package_name, version_name=latest_version, project_root=project_root)
+        inspected = _inspect_apk_manifest(apk_path) if apk_path else {}
+        patched_package_name = str(inspected.get("package_name") or pkg_info.get("patched_package_name") or package_name)
+        raw_clean = pkg_info.get("clean_name")
+        if (not raw_clean or str(raw_clean).strip().lower() in (package_name.lower(), patched_package_name.lower())) and inspected.get("application_label"):
+            raw_clean = inspected["application_label"]
+        clean_name = _resolve_display_name(package_name, raw_clean)
         slug = slugs.get(package_name, _slugify_label(package_name))
 
         app_entry = _build_obtainium_app_entry(
@@ -1080,12 +1306,22 @@ def _collect_active_published_records(
         file_info = ver_details.get("file", {})
         patch_info = ver_details.get("patch", {})
 
-        clean_name = _resolve_display_name(package_name, pkg_info.get("clean_name"))
-        patched_pkg = str(pkg_info.get("patched_package_name") or package_name)
-        version_code = pkg_info.get("patched_version_code") or pkg_info.get("source_version_code")
+        apk_path = _resolve_apk_path(ver_details, package_name=package_name, version_name=ver_name, project_root=project_root)
+        inspected = _inspect_apk_manifest(apk_path) if apk_path else {}
+        patched_pkg = str(
+            inspected.get("package_name")
+            or latest_pub.get("patched_package_name")
+            or pkg_info.get("patched_package_name")
+            or package_name
+        )
+        raw_clean = pkg_info.get("clean_name")
+        if (not raw_clean or str(raw_clean).strip().lower() in (package_name.lower(), patched_pkg.lower())) and inspected.get("application_label"):
+            raw_clean = inspected["application_label"]
+        clean_name = _resolve_display_name(package_name, raw_clean)
+        version_code = inspected.get("version_code") or pkg_info.get("patched_version_code") or pkg_info.get("source_version_code")
         arch = str(pkg_info.get("arch") or "arm64-v8a")
-        min_sdk = pkg_info.get("min_sdk")
-        target_sdk = pkg_info.get("target_sdk")
+        min_sdk = inspected.get("min_sdk") if inspected.get("min_sdk") is not None else pkg_info.get("min_sdk")
+        target_sdk = inspected.get("target_sdk") if inspected.get("target_sdk") is not None else pkg_info.get("target_sdk")
         size_bytes = file_info.get("size_bytes")
         file_size = str(file_info.get("file_size") or _format_bytes(size_bytes))
         sha256 = str(latest_pub.get("sha256") or file_info.get("sha256") or "")
@@ -1555,7 +1791,7 @@ def main(
             logger.warning("[!] GITHUB_RELEASE_REPO is set, but GITHUB_RELEASE_TOKEN/GITHUB_TOKEN is missing. Skipping.")
             return {}
 
-        keep = _parse_keep_env(default=2)
+        keep = _parse_keep_env(default=1)
         force = _parse_bool_env("FORCE_GITHUB_RELEASE", default=False)
         sync_all = _parse_bool_env("GITHUB_RELEASE_SYNC_ALL", default=False)
         allow_cert_change = _parse_bool_env("ALLOW_CERT_CHANGE", default=False)
@@ -1654,16 +1890,29 @@ def main(
                 logger.error(f"[✗] Failed to publish GitHub Release for {package_name} v{version_name}: {e}")
 
         if keep > 0:
-            # Also trigger rollback cleanup if release_state holds any version higher than active_version
+            # Also trigger rollback/keep cleanup if release_state holds more than `keep`
+            # releases or any version higher than active_version.
             for pkg_name, active_ver in active_versions.items():
                 pkg_rel = release_state.get(pkg_name)
                 if isinstance(pkg_rel, dict):
                     active_tup = _parse_version_tuple(active_ver)
-                    if any(_parse_version_tuple(v) > active_tup for v in pkg_rel.keys()):
+                    if len(pkg_rel) > keep or any(_parse_version_tuple(v) > active_tup for v in pkg_rel.keys()):
                         touched_packages.add(pkg_name)
 
             for package_name in touched_packages:
                 try:
+                    active_ver = active_versions.get(package_name)
+                    ver_entry = (
+                        patched_results.get(package_name, {}).get(active_ver, {})
+                        if active_ver and isinstance(patched_results.get(package_name), dict)
+                        else {}
+                    )
+                    pkg_rel = release_state.get(package_name, {}) if isinstance(release_state.get(package_name), dict) else {}
+                    pub_entry = pkg_rel.get(active_ver, {}) if active_ver else {}
+                    patched_pkg = (
+                        (pub_entry.get("patched_package_name") if isinstance(pub_entry, dict) else None)
+                        or (ver_entry.get("package", {}).get("patched_package_name") if isinstance(ver_entry, dict) else None)
+                    )
                     prune_old_releases(
                         package_name,
                         repo,
@@ -1671,7 +1920,8 @@ def main(
                         keep,
                         release_state=release_state,
                         slug=slugs.get(package_name),
-                        active_version=active_versions.get(package_name),
+                        active_version=active_ver,
+                        patched_package_name=patched_pkg,
                     )
                 except Exception as e:
                     logger.error(f"[✗] Failed to prune old GitHub Releases for {package_name}: {e}")

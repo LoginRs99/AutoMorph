@@ -230,7 +230,7 @@ class TestGitHubRelease(unittest.TestCase):
         self.assertEqual(settings["filterReleasesByRegEx"], "^tiktok-v")
         self.assertEqual(settings["apkFilterRegEx"], r"^tiktok-.*\.apk$")
         deeplink = github_release._build_obtainium_deeplink(app_entry)
-        self.assertTrue(deeplink.startswith("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium%3A%2F%2Fadd%2F") or deeplink.startswith("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/"))
+        self.assertTrue(deeplink.startswith("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/"))
 
     def test_4_prune_matches_slug_and_legacy_package_tags(self) -> None:
         mock_releases = [
@@ -314,7 +314,7 @@ class TestGitHubRelease(unittest.TestCase):
             self.assertIn("> [!TIP]", decoded)
             self.assertIn("API 26–35", decoded)
             self.assertIn("| **TikTok** (`tiktok`) | `v44.6.3` | 10.00 MB | API 26–35 | 2 | 2026-11-26 |", decoded)
-            self.assertIn("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/", decoded)
+            self.assertIn("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/", decoded)
             self.assertIn("<details><summary><strong>TikTok</strong>", decoded)
             self.assertIn("| **Source Package** | `com.zhiliaoapp.musically` |", decoded)
             self.assertIn("- Remove ads", decoded)
@@ -389,7 +389,7 @@ class TestGitHubRelease(unittest.TestCase):
             cat_json = json.loads(base64.b64decode(mock_put_cat.call_args.kwargs["json"]["content"]).decode("utf-8"))
             self.assertEqual(cat_json["apps"][0]["slug"], "tiktok")
             self.assertEqual(cat_json["apps"][0]["patch_count"], 1)
-            self.assertTrue(cat_json["apps"][0]["obtainium_add_url"].startswith("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/"))
+            self.assertTrue(cat_json["apps"][0]["obtainium_add_url"].startswith("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/"))
 
             cat_again = github_release.publish_repo_catalog(
                 self.state_dir, self.patched_json, release_state, "user/builds", "tok", project_root=self.tmp
@@ -622,7 +622,7 @@ class TestGitHubRelease(unittest.TestCase):
                 "com.twitter.android",
                 "user/builds",
                 "tok",
-                keep=2,
+                keep=1,
                 release_state=release_state,
                 slug="x-lg",
                 active_version="12.19.1-release.0",
@@ -630,6 +630,99 @@ class TestGitHubRelease(unittest.TestCase):
         self.assertEqual(deleted, ["x-lg-v12.38.1-prod.01"])
         self.assertNotIn("12.38.1-prod.01", release_state["com.twitter.android"])
         self.assertIn("12.19.1-release.0", release_state["com.twitter.android"])
+
+    def test_13_inspect_apk_manifest_axml_and_obtainium_id(self) -> None:
+        def _build_binary_axml(pkg: str, vc: int, vn: str, label: str, min_sdk: int, target_sdk: int) -> bytes:
+            strings = [
+                "manifest", "package", "versionCode", "versionName",
+                "uses-sdk", "minSdkVersion", "targetSdkVersion",
+                "application", "label",
+                pkg, vn, label,
+            ]
+            idx = {s: i for i, s in enumerate(strings)}
+
+            pool_bytes = bytearray()
+            offsets = []
+            for s in strings:
+                offsets.append(len(pool_bytes))
+                enc = s.encode("utf-8")
+                pool_bytes.extend(bytes([len(s), len(enc)]) + enc + b"\x00")
+            while len(pool_bytes) % 4 != 0:
+                pool_bytes.append(0)
+
+            sp_hdr_size = 28
+            strings_start = sp_hdr_size + len(strings) * 4
+            sp_size = strings_start + len(pool_bytes)
+            sp_chunk = (
+                struct.pack("<HHI", 0x0001, sp_hdr_size, sp_size)
+                + struct.pack("<IIIII", len(strings), 0, 0x100, strings_start, 0)
+                + b"".join(struct.pack("<I", o) for o in offsets)
+                + bytes(pool_bytes)
+            )
+
+            def _start_elem(name: str, attrs: list[tuple[str, int, int, int]]) -> bytes:
+                body = struct.pack("<iiHHH", -1, idx[name], 20, 20, len(attrs)) + struct.pack("<HHH", 0, 0, 0)
+                for a_name, raw_idx, tv_type, tv_data in attrs:
+                    body += struct.pack("<iiiHBBi", -1, idx[a_name], raw_idx, 8, 0, tv_type, tv_data)
+                chunk_size = 16 + len(body)
+                return struct.pack("<HHIII", 0x0102, 16, chunk_size, 1, 0xFFFFFFFF & -1) + body
+
+            chunks = (
+                sp_chunk
+                + _start_elem("manifest", [
+                    ("package", idx[pkg], 0x03, idx[pkg]),
+                    ("versionCode", -1, 0x10, vc),
+                    ("versionName", idx[vn], 0x03, idx[vn]),
+                ])
+                + _start_elem("uses-sdk", [
+                    ("minSdkVersion", -1, 0x10, min_sdk),
+                    ("targetSdkVersion", -1, 0x10, target_sdk),
+                ])
+                + _start_elem("application", [
+                    ("label", idx[label], 0x03, idx[label]),
+                ])
+            )
+            return struct.pack("<HHI", 0x0003, 8, 8 + len(chunks)) + chunks
+
+        apk_path = self.tmp / "apps" / "patched" / "com.twitter.android" / "12.19.1-release.0" / "com.twitter.android_12.19.1-release.0_patched.apk"
+        apk_path.parent.mkdir(parents=True, exist_ok=True)
+        axml_bytes = _build_binary_axml("com.lg.android.piko", 312190100, "12.19.1", "X LG", 26, 35)
+        with zipfile.ZipFile(apk_path, "w") as zf:
+            zf.writestr("AndroidManifest.xml", axml_bytes)
+
+        with patch("github_release.shutil.which", return_value=None):
+            inspected = github_release._inspect_apk_manifest(apk_path)
+
+        self.assertEqual(inspected["package_name"], "com.lg.android.piko")
+        self.assertEqual(inspected["version_code"], 312190100)
+        self.assertEqual(inspected["version_name"], "12.19.1")
+        self.assertEqual(inspected["min_sdk"], 26)
+        self.assertEqual(inspected["target_sdk"], 35)
+        self.assertEqual(inspected["application_label"], "X LG")
+
+        # Even if patched.json has stale source package ID as patched_package_name,
+        # Obtainium export and deep-link must use inspected com.lg.android.piko.
+        self.config_path.write_text("packages:\n  - package_name: com.twitter.android\n", encoding="utf-8")
+        stale_entry = _make_patched_entry(
+            "com.twitter.android", "12.19.1-release.0", 312190100, apk_path, ["Piko"], clean_name="X LG"
+        )
+        self.patched_json.write_text(
+            json.dumps({"com.twitter.android": {"12.19.1-release.0": stale_entry}}),
+            encoding="utf-8",
+        )
+        with patch("github_release.shutil.which", return_value=None):
+            out = github_release.build_obtainium_github_export(
+                self.state_dir, self.patched_json, "user/builds", project_root=self.tmp
+            )
+        self.assertIsNotNone(out)
+        data = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(data["apps"][0]["id"], "com.lg.android.piko")
+        deeplink = github_release._build_obtainium_deeplink(data["apps"][0])
+        self.assertTrue(deeplink.startswith("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/"))
+        self.assertIn("com.lg.android.piko", deeplink)
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(github_release._parse_keep_env(), 1)
 
 
 if __name__ == "__main__":
