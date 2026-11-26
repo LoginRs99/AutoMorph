@@ -1415,27 +1415,31 @@ def main(
                 targets.append((package_name, ver))
                 seen.add((package_name, ver))
 
-        # Optionally catch up any un-published latest version in patched.json
-        if patched or sync_all:
-            for package_name, versions in patched_results.items():
-                if not isinstance(versions, dict) or not versions:
-                    continue
-                latest_ver = _select_latest_version(versions)
-                if latest_ver and (package_name, latest_ver) not in seen:
-                    existing = release_state.get(package_name, {}).get(latest_ver)
-                    sha = versions[latest_ver].get("file", {}).get("sha256")
-                    if force or not (isinstance(existing, dict) and sha and existing.get("sha256") == sha):
-                        targets.append((package_name, latest_ver))
-                        seen.add((package_name, latest_ver))
+        # Catch up any un-published (or changed) latest version in patched.json,
+        # and include all latest versions when force=True or sync_all=True.
+        for package_name, versions in patched_results.items():
+            if not isinstance(versions, dict) or not versions:
+                continue
+            latest_ver = _select_latest_version(versions)
+            if latest_ver and (package_name, latest_ver) not in seen:
+                existing = release_state.get(package_name, {}).get(latest_ver)
+                sha = versions[latest_ver].get("file", {}).get("sha256")
+                if force or sync_all or not (isinstance(existing, dict) and sha and existing.get("sha256") == sha):
+                    targets.append((package_name, latest_ver))
+                    seen.add((package_name, latest_ver))
 
         touched_packages: set[str] = set()
         published_items: list[dict[str, Any]] = []
+        skipped_count = 0
+        failed_count = 0
         for package_name, version_name in targets:
             version_entry = patched_results.get(package_name, {}).get(version_name)
             if not isinstance(version_entry, dict):
                 logger.warning(f"[!] No metadata in patched.json for {package_name} v{version_name}.")
+                failed_count += 1
                 continue
             try:
+                mismatches_before = len(cert_mismatches)
                 pub_result = publish_package(
                     package_name=package_name,
                     version_name=version_name,
@@ -1463,7 +1467,12 @@ def main(
                             "arch": pkg_info.get("arch", "arm64-v8a"),
                             "tag": f"{slug}-v{version_name}",
                         })
+                elif len(cert_mismatches) > mismatches_before:
+                    failed_count += 1
+                else:
+                    skipped_count += 1
             except Exception as e:
+                failed_count += 1
                 logger.error(f"[✗] Failed to publish GitHub Release for {package_name} v{version_name}: {e}")
 
         if keep > 0:
@@ -1527,6 +1536,10 @@ def main(
         _write_json(release_state, state_file)
         send_apprise_notification(published_items, repo)
         send_apprise_failure_notification(patch_failures, cert_mismatches, repo)
+        logger.info(
+            f"[*] GitHub Releases summary: {len(targets)} candidate(s) checked, "
+            f"{len(published_items)} uploaded, {skipped_count} skipped, {failed_count} failed."
+        )
         return release_state
 
     except Exception as e:
