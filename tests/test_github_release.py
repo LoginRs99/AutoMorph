@@ -502,6 +502,62 @@ class TestGitHubRelease(unittest.TestCase):
         self.assertIn("+ New patch", patch_json["body"])
         mock_post.assert_called_once()
 
+    def test_10_manager_suffixed_version_lookup(self) -> None:
+        fake_axml_mod = MagicMock()
+        fake_pyaxml = MagicMock()
+        fake_pyaxml.axmlprinter = fake_axml_mod
+        with patch.dict(sys.modules, {"pyaxmlparser": fake_pyaxml, "pyaxmlparser.axmlprinter": fake_axml_mod}):
+            import importlib
+            import manager
+            importlib.reload(manager)
+
+            pkg_versions = {"12.19.1": {"version_code": 312190100}}
+            self.assertEqual(manager._resolve_version_meta(pkg_versions, "12.19.1-release.0")["version_code"], 312190100)
+            self.assertEqual(manager._resolve_version_meta(pkg_versions, "12.19.1")["version_code"], 312190100)
+            self.assertEqual(manager._resolve_version_meta({}, "12.19.1-release.0"), {})
+
+            apk_path = self.tmp / "com.twitter.android_12.19.1-release.0_patched.apk"
+            with zipfile.ZipFile(apk_path, "w") as zf:
+                zf.writestr("AndroidManifest.xml", b"<manifest/>")
+            opts_path = self.tmp / "opts.json"
+            opts_path.write_text("[]", encoding="utf-8")
+            res_path = self.tmp / "result.json"
+            res_path.write_text("{}", encoding="utf-8")
+
+            root_elem = MagicMock()
+            root_elem.attrib = {
+                "package": "com.twitter.android",
+                "{http://schemas.android.com/apk/res/android}versionCode": "312190100",
+                "{http://schemas.android.com/apk/res/android}versionName": "12.19.1",
+            }
+            root_elem.find.return_value = None
+            fake_axml_mod.AXMLPrinter.return_value.get_xml_obj.return_value = root_elem
+
+            p = manager.Patched(
+                repo_details={},
+                detailed_patch_list={"com.twitter.android": {"patch_aliases": {}}},
+                base_url="http://localhost:8080",
+                morphe_location=self.tmp / "morphe-2.3.0.jar",
+                patched_data={},
+                arch="arm64-v8a",
+                enabled_patches_per_app={},
+            )
+            p.make_patched_data("com.twitter.android", {
+                "version_name": "12.19.1-release.0",
+                "repos": set(),
+                "strat": 1,
+                "attempt": 1,
+                "options": opts_path,
+                "output_dest": apk_path,
+                "results_dest": res_path,
+                "package": {"com.twitter.android": pkg_versions},
+                "time": {"time": "2026-11-26 15:00:00", "time_ms": 1795701600000},
+            })
+            self.assertEqual(
+                p.patched_data["com.twitter.android"]["12.19.1"]["package"]["source_version_code"],
+                312190100,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
