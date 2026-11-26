@@ -81,7 +81,7 @@ class Patched:
         package_sha = self.make_sha(details['output_dest'])
         package_size = self.get_size(details['output_dest'])
         pkg_versions = (details.get('package') or {}).get(package_name) or {}
-        version_meta = _resolve_version_meta(pkg_versions, details['version_name'])
+        version_meta = _resolve_version_entry(pkg_versions, details['version_name'])
         vc = version_meta.get('version_code')
         version_code = int(vc) if vc is not None else 0
         min_sdk = None
@@ -445,11 +445,11 @@ def build_all_jsons(state_dir: Path, patched_json: Path, base_url: str) -> None:
         for i in to_write.values():
             write_json(i['data'], i['file'])
 
-def _resolve_version_meta(pkg_versions: dict, version_name: str) -> dict:
+def _resolve_version_entry(pkg_versions: dict, target_version: str) -> dict:
     """Safely resolves version metadata even when patch and APK versions differ by suffix."""
     if not isinstance(pkg_versions, dict) or not pkg_versions:
         return {}
-    ver_str = str(version_name)
+    ver_str = str(target_version)
     if ver_str in pkg_versions and isinstance(pkg_versions[ver_str], dict):
         return pkg_versions[ver_str]
     base_ver = ver_str.split("-", 1)[0]

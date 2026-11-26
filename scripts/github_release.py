@@ -631,7 +631,8 @@ def publish_package(
         and sha256
         and existing_entry.get("sha256") == sha256
     ):
-        logger.info(f"[i] Skipping {package_name} (v{version_name}): already published with matching sha256")
+        existing_tag = existing_entry.get("tag") or f"{resolved_slug}-v{version_name}"
+        logger.info(f"[i] Skipping {package_name} (v{version_name}): already published at {existing_tag}")
         return False
 
     prev_entry = _get_latest_published_entry(release_state, package_name)
@@ -772,6 +773,60 @@ def prune_old_releases(
     return deleted_tags
 
 
+def _build_obtainium_app_entry(
+    patched_package_name: str,
+    clean_name: str,
+    slug: str,
+    latest_version: str,
+    repo: str,
+) -> dict[str, Any]:
+    """Builds an Obtainium GitHub source app entry matching Obtainium's export schema."""
+    owner = repo.split("/", 1)[0]
+    additional_settings = {
+        "includePrereleases": False,
+        "fallbackToOlderReleases": True,
+        "filterReleaseTitlesByRegEx": "",
+        "filterReleaseNotesByRegEx": "",
+        "verifyLatestTag": False,
+        "dontSortReleasesList": False,
+        "useLatestAssetDateAsReleaseDate": False,
+        "releaseTitleAsVersion": False,
+        "trackOnly": False,
+        "versionExtractionRegEx": "",
+        "matchGroupToUse": "",
+        "versionDetection": True,
+        "releaseDateAsVersion": False,
+        "useVersionCodeAsOSVersion": False,
+        "apkFilterRegEx": f"^{re.escape(slug)}-.*\\.apk$",
+        "invertAPKFilter": False,
+        "autoApkFilterByArch": True,
+        "appName": clean_name,
+        "shizukuPretendToBeGooglePlay": False,
+        "allowInsecure": False,
+        "exemptFromBackgroundUpdates": False,
+        "skipUpdateNotifications": False,
+        "about": "",
+        "refreshBeforeDownload": False,
+        "filterReleasesByRegEx": f"^{re.escape(slug)}-v",
+    }
+    return {
+        "id": patched_package_name,
+        "url": f"https://github.com/{repo}",
+        "author": owner,
+        "name": clean_name,
+        "latestVersion": latest_version,
+        "preferredApkIndex": 0,
+        "overrideSource": "GitHub",
+        "additionalSettings": json.dumps(additional_settings),
+    }
+
+
+def _build_obtainium_deeplink(app_entry: dict[str, Any]) -> str:
+    """Returns an Obtainium HTTPS redirect URL for 1-click single-app import."""
+    encoded = quote(json.dumps(app_entry, separators=(",", ":")), safe="")
+    return f"https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/{encoded}"
+
+
 def build_obtainium_github_export(
     state_dir: Path,
     patched_json: Path,
@@ -792,7 +847,6 @@ def build_obtainium_github_export(
     slugs = _resolve_app_slugs(patched_results)
 
     ob_export: dict[str, Any] = {"schemaVersion": 2, "apps": []}
-    repo_url = f"https://github.com/{repo}"
 
     for package_name, versions in patched_results.items():
         if not isinstance(versions, dict) or not versions:
@@ -808,29 +862,17 @@ def build_obtainium_github_export(
 
         latest_details = versions[latest_version]
         pkg_info = latest_details.get("package", {})
-        patched_package_name = pkg_info.get("patched_package_name", package_name)
-        clean_name = pkg_info.get("clean_name", package_name)
+        patched_package_name = pkg_info.get("patched_package_name") or package_name
+        clean_name = pkg_info.get("clean_name") or package_name
         slug = slugs.get(package_name, _slugify_label(package_name))
 
-        additional_settings = {
-            "verifyLatestTag": False,
-            "filterReleasesByRegEx": f"^{re.escape(slug)}-v",
-            "apkFilterRegEx": f"^{re.escape(slug)}-.*\\.apk$",
-            "versionExtractionRegEx": r"\d+(\.\d+)+",
-            "includePrereleases": False,
-            "fallbackToOlderReleases": True,
-        }
-
-        app_entry = {
-            "id": patched_package_name,
-            "name": clean_name,
-            "author": "AutoMorph",
-            "url": repo_url,
-            "latestVersion": latest_version,
-            "preferredApkIndex": 0,
-            "overrideSource": "GitHub",
-            "additionalSettings": json.dumps(additional_settings),
-        }
+        app_entry = _build_obtainium_app_entry(
+            patched_package_name=patched_package_name,
+            clean_name=clean_name,
+            slug=slug,
+            latest_version=latest_version,
+            repo=repo,
+        )
         ob_export["apps"].append(app_entry)
 
     export_path = state_dir / "obtainium-github-export.json"
@@ -948,6 +990,14 @@ def _collect_active_published_records(
         updated_at = str(latest_pub.get("published_at") or "")
         release_url = str(latest_pub.get("release_url") or f"https://github.com/{repo}/releases/tag/{quote(tag, safe='')}")
         apk_url = f"https://github.com/{repo}/releases/download/{quote(tag, safe='')}/{quote(asset_name, safe='')}"
+        app_entry = _build_obtainium_app_entry(
+            patched_package_name=patched_pkg,
+            clean_name=clean_name,
+            slug=slug,
+            latest_version=ver_name,
+            repo=repo,
+        )
+        obtainium_add_url = _build_obtainium_deeplink(app_entry)
 
         records.append({
             "slug": slug,
@@ -971,6 +1021,7 @@ def _collect_active_published_records(
             "asset_name": asset_name,
             "release_url": release_url,
             "apk_url": apk_url,
+            "obtainium_add_url": obtainium_add_url,
         })
 
     records.sort(key=lambda r: (r["clean_name"].lower(), r["package_name"].lower()))
@@ -1049,7 +1100,7 @@ def publish_repo_readme(
             upd_cell = r["updated_at"][:10] if r["updated_at"] else "-"
             lines.append(
                 f"| {app_cell} | {ver_cell} | {r['file_size']} | {sdk_cell} | "
-                f"{patches_cell} | {upd_cell} | **[⬇ Download APK]({r['apk_url']})** |"
+                f"{patches_cell} | {upd_cell} | **[⬇ APK]({r['apk_url']})** · **[📲 Obtainium]({r['obtainium_add_url']})** |"
             )
     else:
         lines.append("| *No active published builds* | - | - | - | - | - | - |")
@@ -1075,6 +1126,7 @@ def publish_repo_readme(
             lines.append(f"| **APK SHA-256** | `{r['sha256']}` |")
             lines.append(f"| **Signing Cert SHA-256** | `{r['cert_sha256'] or 'N/A'}` |")
             lines.append(f"| **Patch Sources** | {repos_str} |")
+            lines.append(f"| **1-Click Obtainium** | [📲 Add to Obtainium]({r['obtainium_add_url']}) |")
             lines.append("")
             lines.append("**Applied Patches:**")
             if r["applied_patches"]:
@@ -1206,6 +1258,7 @@ def publish_repo_catalog(
             "tag": r["tag"],
             "release_url": r["release_url"],
             "apk_url": r["apk_url"],
+            "obtainium_add_url": r["obtainium_add_url"],
         }
         for r in records
     ]

@@ -220,9 +220,17 @@ class TestGitHubRelease(unittest.TestCase):
         self.assertIsNotNone(out)
         data = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(len(data["apps"]), 1)
-        settings = json.loads(data["apps"][0]["additionalSettings"])
+        app_entry = data["apps"][0]
+        self.assertEqual(app_entry["author"], "user")
+        settings = json.loads(app_entry["additionalSettings"])
+        self.assertFalse(settings["verifyLatestTag"])
+        self.assertFalse(settings["releaseTitleAsVersion"])
+        self.assertTrue(settings["versionDetection"])
+        self.assertTrue(settings["autoApkFilterByArch"])
         self.assertEqual(settings["filterReleasesByRegEx"], "^tiktok-v")
         self.assertEqual(settings["apkFilterRegEx"], r"^tiktok-.*\.apk$")
+        deeplink = github_release._build_obtainium_deeplink(app_entry)
+        self.assertTrue(deeplink.startswith("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium%3A%2F%2Fadd%2F") or deeplink.startswith("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/"))
 
     def test_4_prune_matches_slug_and_legacy_package_tags(self) -> None:
         mock_releases = [
@@ -306,6 +314,7 @@ class TestGitHubRelease(unittest.TestCase):
             self.assertIn("> [!TIP]", decoded)
             self.assertIn("API 26–35", decoded)
             self.assertIn("| **TikTok** (`tiktok`) | `v44.6.3` | 10.00 MB | API 26–35 | 2 | 2026-11-26 |", decoded)
+            self.assertIn("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/", decoded)
             self.assertIn("<details><summary><strong>TikTok</strong>", decoded)
             self.assertIn("| **Source Package** | `com.zhiliaoapp.musically` |", decoded)
             self.assertIn("- Remove ads", decoded)
@@ -380,6 +389,7 @@ class TestGitHubRelease(unittest.TestCase):
             cat_json = json.loads(base64.b64decode(mock_put_cat.call_args.kwargs["json"]["content"]).decode("utf-8"))
             self.assertEqual(cat_json["apps"][0]["slug"], "tiktok")
             self.assertEqual(cat_json["apps"][0]["patch_count"], 1)
+            self.assertTrue(cat_json["apps"][0]["obtainium_add_url"].startswith("https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://add/"))
 
             cat_again = github_release.publish_repo_catalog(
                 self.state_dir, self.patched_json, release_state, "user/builds", "tok", project_root=self.tmp
@@ -512,9 +522,9 @@ class TestGitHubRelease(unittest.TestCase):
             importlib.reload(manager)
 
             pkg_versions = {"12.19.1": {"version_code": 312190100}}
-            self.assertEqual(manager._resolve_version_meta(pkg_versions, "12.19.1-release.0")["version_code"], 312190100)
-            self.assertEqual(manager._resolve_version_meta(pkg_versions, "12.19.1")["version_code"], 312190100)
-            self.assertEqual(manager._resolve_version_meta({}, "12.19.1-release.0"), {})
+            self.assertEqual(manager._resolve_version_entry(pkg_versions, "12.19.1-release.0")["version_code"], 312190100)
+            self.assertEqual(manager._resolve_version_entry(pkg_versions, "12.19.1")["version_code"], 312190100)
+            self.assertEqual(manager._resolve_version_entry({}, "12.19.1-release.0"), {})
 
             apk_path = self.tmp / "com.twitter.android_12.19.1-release.0_patched.apk"
             with zipfile.ZipFile(apk_path, "w") as zf:
