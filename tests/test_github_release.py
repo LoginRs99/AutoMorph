@@ -724,6 +724,286 @@ class TestGitHubRelease(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             self.assertEqual(github_release._parse_keep_env(), 1)
 
+    def test_14_release_card_and_config_release_body(self) -> None:
+        dummy_apk = self.tmp / "x-lg.apk"
+        entry = _make_patched_entry(
+            "com.twitter.android",
+            "12.19.1-release.0",
+            312190100,
+            dummy_apk,
+            ["Hide ads", "Piko settings"],
+            sha256="c" * 64,
+            clean_name="X LG",
+        )
+        diff_info = {
+            "version_transition": "12.19.0 -> 12.19.1-release.0",
+            "added_patches": ["Piko settings"],
+            "removed_patches": ["Old patch"],
+            "is_initial": False,
+            "patch_diff_short": "+1 / -1 patches",
+            "summary": "12.19.0 -> 12.19.1-release.0; +1 / -1 patch(es)",
+        }
+        body = github_release._build_release_body(
+            package_name="com.twitter.android",
+            version_name="12.19.1-release.0",
+            version_entry=entry,
+            diff_info=diff_info,
+            cert_sha256="d" * 64,
+            patched_package_name="com.lg.android.piko",
+            slug="x-lg",
+            repo="user/builds",
+            tag="x-lg-v12.19.1-release.0",
+            asset_name="x-lg-12.19.1-release.0-arm64-v8a-morphe.apk",
+        )
+        self.assertIn("https://img.shields.io/badge/Version-", body)
+        self.assertIn("style=flat-square", body)
+        self.assertIn("https://img.shields.io/badge/Package%20ID-com.lg.android.piko-6366F1?style=flat-square", body)
+        self.assertIn("[📲 Add to Obtainium](https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/", body)
+        self.assertIn("com.lg.android.piko", body)
+        self.assertIn("> [!NOTE]", body)
+        self.assertIn("**+1 added, -1 removed**", body)
+        self.assertIn("`+ Piko settings`, `- Old patch`", body)
+        self.assertIn("*(source: `com.twitter.android`)*", body)
+        self.assertIn("<details><summary><strong>🧩 Applied Patches (2)</strong></summary>", body)
+        self.assertIn("<details><summary><strong>🔐 Checksums &amp; Signing Certificate</strong></summary>", body)
+        self.assertIn("sha256sum x-lg-12.19.1-release.0-arm64-v8a-morphe.apk", body)
+
+        export_path = self.state_dir / "obtainium-github-export.json"
+        export_path.write_text(
+            json.dumps({
+                "schemaVersion": 2,
+                "apps": [
+                    github_release._build_obtainium_app_entry(
+                        "com.lg.android.piko", "X LG", "x-lg", "12.19.1-release.0", "user/builds"
+                    )
+                ],
+            }),
+            encoding="utf-8",
+        )
+        with patch.object(github_release, "_upsert_release_and_upload", return_value=(42, "https://github.com/user/builds/releases/tag/automorph-config")) as mock_up:
+            github_release.publish_obtainium_config_release(export_path, "user/builds", "tok", release_state={})
+        cfg_body = mock_up.call_args.kwargs["body"]
+        self.assertIn("img.shields.io/badge/Active%20Apps-1-20cfce?style=flat-square", cfg_body)
+        self.assertIn("Obtainium%20v1.x%20Export", cfg_body)
+        self.assertIn("| **X LG** | `com.lg.android.piko` | `^x\\-lg-v` |", cfg_body)
+
+    def test_15_state_dir_apks_discovery_and_stale_prefix_rewrite(self) -> None:
+        # Simulate container where patched.json has stale /automorph/apps/patched/...
+        # locations, rolled-back 12.38.1-prod.01 was deleted from disk, and the real
+        # active APK lives in state_dir.parent / "apks" / package / version.
+        apks_root = self.state_dir.parent / "apks"
+        active_apk = apks_root / "com.twitter.android" / "12.19.1-release.0" / "com.twitter.android_12.19.1-release.0_patched.apk"
+        active_apk.parent.mkdir(parents=True, exist_ok=True)
+        active_apk.write_bytes(b"FAKE-APK-BYTES")
+
+        stale_missing = Path("/automorph/apps/patched/com.twitter.android/12.38.1-prod.01/com.twitter.android_12.38.1-prod.01_patched.apk")
+        stale_active = Path("/automorph/apps/patched/com.twitter.android/12.19.1-release.0/com.twitter.android_12.19.1-release.0_patched.apk")
+
+        versions = {
+            "12.38.1-prod.01": _make_patched_entry("com.twitter.android", "12.38.1-prod.01", 312380100, stale_missing, ["P1"], sha256="1" * 64, clean_name="X LG"),
+            "12.19.1-release.0": _make_patched_entry("com.twitter.android", "12.19.1-release.0", 312190100, stale_active, ["P1"], sha256="2" * 64, clean_name="X LG"),
+        }
+
+        selected = github_release._select_active_version_entry(
+            versions,
+            package_name="com.twitter.android",
+            project_root=self.tmp,
+            state_dir=self.state_dir,
+        )
+        self.assertEqual(selected, "12.19.1-release.0")
+
+        resolved = github_release._resolve_apk_path(
+            versions["12.19.1-release.0"],
+            package_name="com.twitter.android",
+            version_name="12.19.1-release.0",
+            project_root=self.tmp,
+            state_dir=self.state_dir,
+        )
+        self.assertEqual(resolved, active_apk)
+
+        with patch.object(github_release, "_upsert_release_and_upload", return_value=(101, "https://github.com/user/builds/releases/tag/x-lg-v12.19.1-release.0")) as mock_up:
+            res = github_release.publish_package(
+                package_name="com.twitter.android",
+                version_name="12.19.1-release.0",
+                version_entry=versions["12.19.1-release.0"],
+                repo="user/builds",
+                token="tok",
+                release_state={},
+                slug="x-lg",
+                project_root=self.tmp,
+                state_dir=self.state_dir,
+            )
+        self.assertIsInstance(res, dict)
+        self.assertEqual(mock_up.call_args.kwargs["asset_path"], active_apk)
+
+    def test_16_end_to_end_container_layout_rollback_and_manifest(self) -> None:
+        def _build_axml(pkg: str, vc: int, vn: str, label: str) -> bytes:
+            strings = [
+                "manifest", "package", "versionCode", "versionName",
+                "uses-sdk", "minSdkVersion", "targetSdkVersion",
+                "application", "label",
+                pkg, vn, label,
+            ]
+            idx = {s: i for i, s in enumerate(strings)}
+            pool = bytearray()
+            offsets = []
+            for s in strings:
+                offsets.append(len(pool))
+                enc = s.encode("utf-8")
+                pool.extend(bytes([len(s), len(enc)]) + enc + b"\x00")
+            while len(pool) % 4 != 0:
+                pool.append(0)
+            sp_hdr = 28
+            str_start = sp_hdr + len(strings) * 4
+            sp = (
+                struct.pack("<HHI", 0x0001, sp_hdr, str_start + len(pool))
+                + struct.pack("<IIIII", len(strings), 0, 0x100, str_start, 0)
+                + b"".join(struct.pack("<I", o) for o in offsets)
+                + bytes(pool)
+            )
+
+            def _elem(name: str, attrs: list[tuple[str, int, int, int]]) -> bytes:
+                body = struct.pack("<iiHHH", -1, idx[name], 20, 20, len(attrs)) + struct.pack("<HHH", 0, 0, 0)
+                for a_name, raw_idx, tv_type, tv_data in attrs:
+                    body += struct.pack("<iiiHBBi", -1, idx[a_name], raw_idx, 8, 0, tv_type, tv_data)
+                return struct.pack("<HHIII", 0x0102, 16, 16 + len(body), 1, 0xFFFFFFFF) + body
+
+            chunks = (
+                sp
+                + _elem("manifest", [
+                    ("package", idx[pkg], 0x03, idx[pkg]),
+                    ("versionCode", -1, 0x10, vc),
+                    ("versionName", idx[vn], 0x03, idx[vn]),
+                ])
+                + _elem("uses-sdk", [("minSdkVersion", -1, 0x10, 26), ("targetSdkVersion", -1, 0x10, 35)])
+                + _elem("application", [("label", idx[label], 0x03, idx[label])])
+            )
+            return struct.pack("<HHI", 0x0003, 8, 8 + len(chunks)) + chunks
+
+        def _write_apk(dest: Path, pkg: str, vc: int, vn: str, label: str) -> None:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(dest, "w") as zf:
+                zf.writestr("AndroidManifest.xml", _build_axml(pkg, vc, vn, label))
+
+        patched_root = self.state_dir.parent / "patched"
+        _write_apk(patched_root / "com.zhiliaoapp.musically" / "47.9.3" / "com.zhiliaoapp.musically_47.9.3_patched.apk", "com.zhiliaoapp.musically", 470903, "47.9.3", "TikTok")
+        _write_apk(patched_root / "com.google.android.youtube" / "21.45.82" / "com.google.android.youtube_21.45.82_patched.apk", "com.google.android.youtube", 214582, "21.45.82", "YouTube LG")
+        _write_apk(patched_root / "com.twitter.android" / "12.19.1-release.0" / "com.twitter.android_12.19.1-release.0_patched.apk", "com.lg.android.piko", 312190100, "12.19.1", "X LG")
+        _write_apk(patched_root / "com.reddit.frontpage" / "2026.45.0" / "com.reddit.frontpage_2026.45.0_patched.apk", "com.reddit.frontpage", 2026450, "2026.45.0", "Reddit")
+
+        self.config_path.write_text(
+            "packages:\n"
+            "  - package_name: com.zhiliaoapp.musically\n"
+            "  - package_name: com.google.android.youtube\n"
+            "  - package_name: com.twitter.android\n"
+            "  - package_name: com.reddit.frontpage\n",
+            encoding="utf-8",
+        )
+        patched_data = {
+            "com.zhiliaoapp.musically": {
+                "47.9.3": _make_patched_entry("com.zhiliaoapp.musically", "47.9.3", 470903, Path("/automorph/apps/patched/com.zhiliaoapp.musically/47.9.3/com.zhiliaoapp.musically_47.9.3_patched.apk"), ["P1"], sha256="1" * 64, clean_name="com.zhiliaoapp.musically"),
+            },
+            "com.google.android.youtube": {
+                "21.45.82": _make_patched_entry("com.google.android.youtube", "21.45.82", 214582, Path("/automorph/apps/patched/com.google.android.youtube/21.45.82/com.google.android.youtube_21.45.82_patched.apk"), ["P2"], sha256="2" * 64, clean_name="YouTube LG"),
+            },
+            "com.twitter.android": {
+                "12.38.1-prod.01": _make_patched_entry("com.twitter.android", "12.38.1-prod.01", 312380100, Path("/automorph/apps/patched/com.twitter.android/12.38.1-prod.01/com.twitter.android_12.38.1-prod.01_patched.apk"), ["P3"], sha256="3" * 64, clean_name="X LG"),
+                "12.19.1-release.0": _make_patched_entry("com.twitter.android", "12.19.1-release.0", 312190100, Path("/automorph/apps/patched/com.twitter.android/12.19.1-release.0/com.twitter.android_12.19.1-release.0_patched.apk"), ["P3"], sha256="4" * 64, clean_name="X LG"),
+            },
+            "com.reddit.frontpage": {
+                "2026.48.0": _make_patched_entry("com.reddit.frontpage", "2026.48.0", 2026480, Path("/automorph/apps/patched/com.reddit.frontpage/2026.48.0/com.reddit.frontpage_2026.48.0_patched.apk"), ["P4"], sha256="5" * 64, clean_name=""),
+                "2026.45.0": _make_patched_entry("com.reddit.frontpage", "2026.45.0", 2026450, Path("/automorph/apps/patched/com.reddit.frontpage/2026.45.0/com.reddit.frontpage_2026.45.0_patched.apk"), ["P4"], sha256="6" * 64, clean_name=""),
+            },
+        }
+        self.patched_json.write_text(json.dumps(patched_data), encoding="utf-8")
+
+        # Pre-seed github_releases.json with rolled-back x-lg-v12.38.1-prod.01
+        state_file = self.state_dir / "github_releases.json"
+        state_file.write_text(
+            json.dumps({
+                "com.twitter.android": {
+                    "12.38.1-prod.01": {"tag": "x-lg-v12.38.1-prod.01", "published_at": "2026-11-25T10:00:00+00:00"},
+                }
+            }),
+            encoding="utf-8",
+        )
+
+        published_bodies: dict[str, str] = {}
+        deleted_tags: list[str] = []
+        uploaded_files: dict[str, str] = {}
+        mock_apprise_mod = MagicMock()
+        mock_apobj = MagicMock()
+        mock_apprise_mod.Apprise.return_value = mock_apobj
+
+        def _fake_upsert(repo, token, tag, title, body, asset_path, asset_name, content_type):
+            published_bodies[tag] = body
+            return 100 + len(published_bodies), f"https://github.com/{repo}/releases/tag/{tag}"
+
+        def _fake_get(url, headers=None, timeout=None):
+            resp = MagicMock(status_code=200)
+            if "/releases?per_page=100" in url:
+                resp.json.return_value = [
+                    {"id": 999, "tag_name": "x-lg-v12.38.1-prod.01", "created_at": "2026-11-25T10:00:00Z"},
+                    {"id": 1000, "tag_name": "x-lg-v12.19.1-release.0", "created_at": "2026-11-26T10:00:00Z"},
+                ]
+            elif "/contents/" in url:
+                resp.status_code = 404
+            return resp
+
+        def _fake_delete(url, headers=None, timeout=None):
+            if "/git/refs/tags/" in url:
+                deleted_tags.append(url.rsplit("/", 1)[-1])
+            return MagicMock(status_code=204)
+
+        def _fake_put(url, headers=None, json=None, timeout=None):
+            fname = url.split("/contents/", 1)[1]
+            uploaded_files[fname] = base64.b64decode(json["content"]).decode("utf-8")
+            return MagicMock(status_code=201)
+
+        with patch.dict(os.environ, {
+            "GITHUB_RELEASE_REPO": "user/builds",
+            "GITHUB_RELEASE_TOKEN": "tok",
+            "APPRISE_URL": "ntfy://topic",
+            "GITHUB_RELEASE_UPDATE_README": "true",
+            "GITHUB_RELEASE_UPDATE_CHANGELOG": "true",
+            "GITHUB_RELEASE_UPDATE_CATALOG": "true",
+        }, clear=True), \
+             patch("github_release.shutil.which", return_value=None), \
+             patch("github_release.apprise", mock_apprise_mod), \
+             patch("github_release._upsert_release_and_upload", side_effect=_fake_upsert), \
+             patch("github_release.requests.get", side_effect=_fake_get), \
+             patch("github_release.requests.delete", side_effect=_fake_delete), \
+             patch("github_release.requests.put", side_effect=_fake_put):
+            github_release.main({}, self.state_dir, self.patched_json, self.tmp)
+
+        self.assertIn("x-lg-v12.38.1-prod.01", deleted_tags)
+        for expected_tag in (
+            "tiktok-v47.9.3",
+            "youtube-lg-v21.45.82",
+            "x-lg-v12.19.1-release.0",
+            "reddit-v2026.45.0",
+        ):
+            self.assertIn(expected_tag, published_bodies)
+            self.assertIn("<details><summary><strong>🧩 Applied Patches", published_bodies[expected_tag])
+
+        self.assertIn("com.lg.android.piko", published_bodies["x-lg-v12.19.1-release.0"])
+        export_data = json.loads((self.state_dir / "obtainium-github-export.json").read_text(encoding="utf-8"))
+        by_name = {a["name"]: a for a in export_data["apps"]}
+        self.assertEqual(by_name["X LG"]["id"], "com.lg.android.piko")
+        x_settings = json.loads(by_name["X LG"]["additionalSettings"])
+        self.assertFalse(x_settings["verifyLatestTag"])
+        self.assertFalse(x_settings["releaseTitleAsVersion"])
+        self.assertEqual(x_settings["filterReleasesByRegEx"], "^x\\-lg-v")
+
+        self.assertIn("README.md", uploaded_files)
+        self.assertIn("CHANGELOG.md", uploaded_files)
+        self.assertIn("catalog.json", uploaded_files)
+        self.assertIn("obtainium://app/", uploaded_files["README.md"])
+        cat = json.loads(uploaded_files["catalog.json"])
+        self.assertTrue(any(a["patched_package"] == "com.lg.android.piko" for a in cat["apps"]))
+        mock_apobj.notify.assert_called_once()
+        self.assertEqual(mock_apobj.notify.call_args.kwargs["title"], "AutoMorph: 4 apps released")
+
 
 if __name__ == "__main__":
     unittest.main()
